@@ -3,7 +3,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import math
-
+import os
 from modules.transformer import TransformerEncoder
 from modality_correlation.correlation_models import CorrelationModel
 
@@ -116,7 +116,7 @@ class TrimodalMultiheadAttention(nn.Module):
         # 只有当 T_q == T_k 时这行代码才成立 (Square matrix)。
         # 假设: 在 TriSAT 中所有模态都被对齐或 Padding 到相同长度 (seq_len)。
         
-        attn = torch.bmm(fused_weights, q) 
+        attn = torch.bmm(fused_weights, v) 
         
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
@@ -163,7 +163,7 @@ dataset_specific_configs = {
         "audio_in_dim": 74,
         "vision_in_dim": 35,
         "d_model": 128,
-        "num_layers": 3,
+        "num_layers": 3,    
         "num_heads": 4,
         "dim_feedforward": 256,
         "dropout": 0.1,
@@ -208,11 +208,27 @@ class MULTModel(nn.Module):
 
         # 2. End-to-End Correlation Model
         if self.use_correlation:
-            self.corr_model = CorrelationModel(
-                **dataset_specific_configs[hyp_params.dataset]
-            )
-            self.corr_model.load_state_dict(torch.load(hyp_params.corr_model_path, map_location='cpu'))
-
+            # === [关键修改] 动态获取真实维度 ===
+            # 先复制一份默认配置
+            corr_config = dataset_specific_configs[hyp_params.dataset].copy()
+            
+            # 用 hyp_params 中读取到的真实维度覆盖默认配置
+            # main.py 中已经通过 train_data.get_dim() 获取了这三个值
+            corr_config['text_in_dim'] = hyp_params.orig_d_l
+            corr_config['audio_in_dim'] = hyp_params.orig_d_a
+            corr_config['vision_in_dim'] = hyp_params.orig_d_v
+            
+            # 使用更新后的配置初始化
+            self.corr_model = CorrelationModel(**corr_config)
+            # === 【修改点 1】: 允许端到端冷启动，不再强制加载路径 ===
+            # 原代码：self.corr_model.load_state_dict(torch.load(hyp_params.corr_model_path, map_location='cpu'))
+            
+            if hasattr(hyp_params, 'corr_model_path') and os.path.exists(hyp_params.corr_model_path):
+                print(f"Loading pretrained correlation model from {hyp_params.corr_model_path}")
+                self.corr_model.load_state_dict(torch.load(hyp_params.corr_model_path, map_location='cpu'))
+            else:
+                print("No pretrained path found or file does not exist. Starting CorrelationModel from SCRATCH (End-to-End Mode).")
+                
         # 3. TriSAT Layers
         # Stream 1: Q=Text, K=Audio, V=Video
         self.trisat_stream1 = nn.ModuleList([
@@ -231,8 +247,11 @@ class MULTModel(nn.Module):
         self.w_ta = nn.Parameter(torch.tensor(0.33))
         self.w_va = nn.Parameter(torch.tensor(0.33))
         self.w_av = nn.Parameter(torch.tensor(0.33))
-        self.lambda_param = nn.Parameter(torch.tensor(0.1))
-
+        # === 【修改点 2】: 将 lambda_param 初始化为 0.0 ===
+        # 原代码：self.lambda_param = nn.Parameter(torch.tensor(0.1))
+        # 修改意图：初期 Bias 为噪声，我们希望它对 Attention 的影响为 0。
+        # 随着训练，优化器会根据梯度自动调整这个值（如果 Bias 变得有用）。
+        self.lambda_param = nn.Parameter(torch.tensor(0.0))
         # 5. Output Layers
         combined_dim = 2 * self.d_model
         self.proj1 = nn.Linear(combined_dim, combined_dim)

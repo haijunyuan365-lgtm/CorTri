@@ -3,7 +3,7 @@ import pickle
 import numpy as np
 import torch
 from torch.utils.data.dataset import Dataset
-from mmsdk import mmdatasdk as md
+# from mmsdk import mmdatasdk as md
 
 class Multimodal_Datasets(Dataset):
     def __init__(
@@ -34,113 +34,169 @@ class Multimodal_Datasets(Dataset):
         self.num_samples = len(self.labels)
 
     def _load_mosei(self, dataset_path):
-        """
-        Logic to load and process the CMU-MOSEI dataset
-        """
-        # Define the .csd files to load
-        recipe = {
-            'glove_vectors': os.path.join(dataset_path, 'CMU_MOSEI_TimestampedWordVectors.csd'),
-            'COVAREP': os.path.join(dataset_path, 'CMU_MOSEI_COVAREP.csd'),
-            'FACET_4.2': os.path.join(dataset_path, 'CMU_MOSEI_VisualFacet42.csd'),
-            'Labels': os.path.join(dataset_path, 'CMU_MOSEI_Labels.csd')
-        }
+            """
+            修正版：自动检测 .pkl 文件中的键名 (labels vs regression_labels)
+            """
+            # 1. 确定文件名
+            pkl_name = "aligned_50.pkl" if self.if_align else "unaligned_50.pkl"
+            pkl_path = os.path.join(dataset_path, pkl_name)
 
-        # Load the dataset
-        dataset = md.mmdataset(recipe)
+            # 2. 加载 .pkl 文件
+            if os.path.exists(pkl_path):
+                print(f"检测到预处理文件 {pkl_path}，正在加载...")
+                with open(pkl_path, 'rb') as f:
+                    data = pickle.load(f)
+                
+                # 提取对应的数据划分 (train/valid/test)
+                split_data = data[self.split_type]
+                
+                # --- 调试信息：打印一下所有键名，确保万无一失 ---
+                # 第一次运行如果不确定，可以看到终端输出 keys
+                # print(f"Available keys in {self.split_type}: {split_data.keys()}")
+                
+                # 3. 加载特征 (使用 .get 避免 KeyError，或者尝试常见键名)
+                # 文本通常是 'text' 或 'text_bert'，这里假设是 'text'
+                self.text = [torch.tensor(x).float() for x in split_data['text']]
+                self.audio = [torch.tensor(x).float() for x in split_data['audio']]
+                self.vision = [torch.tensor(x).float() for x in split_data['vision']]
+                
+                # 4. 加载标签 (核心修复点)
+                if 'labels' in split_data:
+                    self.labels = [torch.tensor(y).float() for y in split_data['labels']]
+                elif 'regression_labels' in split_data:
+                    # CMU-MOSEI 通常用这个键名存储 -3 到 +3 的情感分数
+                    self.labels = [torch.tensor(y).float() for y in split_data['regression_labels']]
+                elif 'classification_labels' in split_data:
+                    self.labels = [torch.tensor(y).float() for y in split_data['classification_labels']]
+                else:
+                    raise KeyError(f"在数据中找不到标签！可用键名: {list(split_data.keys())}")
+                
+                # 5. 加载 ID
+                if 'id' in split_data:
+                    self.meta = split_data['id']
+                else:
+                    self.meta = [str(i) for i in range(len(self.labels))]
 
-        # Align data
-        if self.if_align:
-            dataset.align('glove_vectors')
-        else:
-            # If not aligning, apply padding or other processing as needed
-            pass
+                # 限制样本数
+                if self.max_samples is not None:
+                    self.text = self.text[:self.max_samples]
+                    self.audio = self.audio[:self.max_samples]
+                    self.vision = self.vision[:self.max_samples]
+                    self.labels = self.labels[:self.max_samples]
+                    self.meta = self.meta[:self.max_samples]
 
-        # Get standard splits
-        train_split = md.cmu_mosei.standard_folds.standard_train_fold
-        valid_split = md.cmu_mosei.standard_folds.standard_valid_fold
-        test_split = md.cmu_mosei.standard_folds.standard_test_fold
+                print(f"成功加载 {self.split_type} 数据 (来自 pkl)，共 {len(self.labels)} 条。")
+                return
 
-        if self.split_type == 'train':
-            split_ids = train_split
-        elif self.split_type == 'valid':
-            split_ids = valid_split
-        else:
-            split_ids = test_split
+        # # ==========================================
+        # # 3. 如果没有 .pkl，才尝试旧的 .csd 加载逻辑 (保留原代码作为后备)
+        # # ==========================================
+        # print(f"未找到 {pkl_path}，尝试加载原始 .csd 文件...")
+        
+        # # Define the .csd files to load
+        # recipe = {
+        #     'glove_vectors': os.path.join(dataset_path, 'CMU_MOSEI_TimestampedWordVectors.csd'),
+        #     'COVAREP': os.path.join(dataset_path, 'CMU_MOSEI_COVAREP.csd'),
+        #     'FACET_4.2': os.path.join(dataset_path, 'CMU_MOSEI_VisualFacet42.csd'),
+        #     'Labels': os.path.join(dataset_path, 'CMU_MOSEI_Labels.csd')
+        # }
 
-        # Limit sample size if needed
-        if self.max_samples is not None:
-            split_ids = split_ids[:self.max_samples]
+        # # Load the dataset
+        # dataset = md.mmdataset(recipe)
 
-        # Prepare 5 lists to maintain consistency with unified attributes
-        text_list = []
-        audio_list = []
-        vision_list = []
-        labels_list = []
-        meta_list = []
+        # # Align data
+        # if self.if_align:
+        #     dataset.align('glove_vectors')
+        # else:
+        #     # If not aligning, apply padding or other processing as needed
+        #     pass
 
-        for vid in split_ids:
-            try:
-                words_data = dataset.computational_sequences['glove_vectors'].data[vid]
-                audio_data = dataset.computational_sequences['COVAREP'].data[vid]
-                vision_data = dataset.computational_sequences['FACET_4.2'].data[vid]
-                labels_data = dataset.computational_sequences['Labels'].data[vid]
+        # # Get standard splits
+        # train_split = md.cmu_mosei.standard_folds.standard_train_fold
+        # valid_split = md.cmu_mosei.standard_folds.standard_valid_fold
+        # test_split = md.cmu_mosei.standard_folds.standard_test_fold
 
-                text_feat = words_data['features']
-                text_times = words_data['intervals']
+        # if self.split_type == 'train':
+        #     split_ids = train_split
+        # elif self.split_type == 'valid':
+        #     split_ids = valid_split
+        # else:
+        #     split_ids = test_split
 
-                audio_feat = audio_data['features']
-                audio_times = audio_data['intervals']
+        # # Limit sample size if needed
+        # if self.max_samples is not None:
+        #     split_ids = split_ids[:self.max_samples]
 
-                vision_feat = vision_data['features']
-                vision_times = vision_data['intervals']
+        # # Prepare 5 lists to maintain consistency with unified attributes
+        # text_list = []
+        # audio_list = []
+        # vision_list = []
+        # labels_list = []
+        # meta_list = []
 
-                label_feat = labels_data['features']
-                label_times = labels_data['intervals']
+        # for vid in split_ids:
+        #     try:
+        #         words_data = dataset.computational_sequences['glove_vectors'].data[vid]
+        #         audio_data = dataset.computational_sequences['COVAREP'].data[vid]
+        #         vision_data = dataset.computational_sequences['FACET_4.2'].data[vid]
+        #         labels_data = dataset.computational_sequences['Labels'].data[vid]
 
-                # Perform sentence-level segmentation based on the timestamps provided by Labels
-                for i in range(len(label_feat)):
-                    start_time, end_time = label_times[i]
+        #         text_feat = words_data['features']
+        #         text_times = words_data['intervals']
 
-                    # Extract token/frame/time step within the [start_time, end_time] range
-                    # Text
-                    text_indices = (text_times[:, 0] >= start_time) & (text_times[:, 1] <= end_time)
-                    text_segment = text_feat[text_indices]
+        #         audio_feat = audio_data['features']
+        #         audio_times = audio_data['intervals']
 
-                    # Audio
-                    audio_indices = (audio_times[:, 0] >= start_time) & (audio_times[:, 1] <= end_time)
-                    audio_segment = audio_feat[audio_indices]
+        #         vision_feat = vision_data['features']
+        #         vision_times = vision_data['intervals']
 
-                    # Vision
-                    vision_indices = (vision_times[:, 0] >= start_time) & (vision_times[:, 1] <= end_time)
-                    vision_segment = vision_feat[vision_indices]
+        #         label_feat = labels_data['features']
+        #         label_times = labels_data['intervals']
 
-                    # Label
-                    label = label_feat[i][0]
-                    label = int(label)  # Convert to integer
+        #         # Perform sentence-level segmentation based on the timestamps provided by Labels
+        #         for i in range(len(label_feat)):
+        #             start_time, end_time = label_times[i]
 
-                    # Skip if data contains NaN or Inf
-                    if (np.isnan(text_segment).any() or np.isinf(text_segment).any() or
-                        np.isnan(audio_segment).any() or np.isinf(audio_segment).any() or
-                        np.isnan(vision_segment).any() or np.isinf(vision_segment).any() or
-                        np.isnan(label).any() or np.isinf(label).any()):
-                        continue
+        #             # Extract token/frame/time step within the [start_time, end_time] range
+        #             # Text
+        #             text_indices = (text_times[:, 0] >= start_time) & (text_times[:, 1] <= end_time)
+        #             text_segment = text_feat[text_indices]
 
-                    text_list.append(torch.tensor(text_segment, dtype=torch.float32))
-                    audio_list.append(torch.tensor(audio_segment, dtype=torch.float32))
-                    vision_list.append(torch.tensor(vision_segment, dtype=torch.float32))
-                    labels_list.append(torch.tensor(label, dtype=torch.float32))
-                    meta_list.append(vid)
+        #             # Audio
+        #             audio_indices = (audio_times[:, 0] >= start_time) & (audio_times[:, 1] <= end_time)
+        #             audio_segment = audio_feat[audio_indices]
 
-            except KeyError:
-                # Some samples may be missing data for a specific modality
-                continue
+        #             # Vision
+        #             vision_indices = (vision_times[:, 0] >= start_time) & (vision_times[:, 1] <= end_time)
+        #             vision_segment = vision_feat[vision_indices]
 
-        # Store processed data in class attributes
-        self.text = text_list
-        self.audio = audio_list
-        self.vision = vision_list
-        self.labels = labels_list
-        self.meta = meta_list
+        #             # Label
+        #             label = label_feat[i][0]
+        #             label = int(label)  # Convert to integer
+
+        #             # Skip if data contains NaN or Inf
+        #             if (np.isnan(text_segment).any() or np.isinf(text_segment).any() or
+        #                 np.isnan(audio_segment).any() or np.isinf(audio_segment).any() or
+        #                 np.isnan(vision_segment).any() or np.isinf(vision_segment).any() or
+        #                 np.isnan(label).any() or np.isinf(label).any()):
+        #                 continue
+
+        #             text_list.append(torch.tensor(text_segment, dtype=torch.float32))
+        #             audio_list.append(torch.tensor(audio_segment, dtype=torch.float32))
+        #             vision_list.append(torch.tensor(vision_segment, dtype=torch.float32))
+        #             labels_list.append(torch.tensor(label, dtype=torch.float32))
+        #             meta_list.append(vid)
+
+        #     except KeyError:
+        #         # Some samples may be missing data for a specific modality
+        #         continue
+
+        # # Store processed data in class attributes
+        # self.text = text_list
+        # self.audio = audio_list
+        # self.vision = vision_list
+        # self.labels = labels_list
+        # self.meta = meta_list
 
     def _load_ch_sims(self, dataset_path, pkl_filename):
         """

@@ -1,0 +1,9 @@
+cat >> .gitignore <<'EOF'
+# python cache
+__pycache__/
+*.pyc
+
+# datasets / artifacts
+data/MOSEI/
+pre_trained_models/
+EOF

@@ -66,10 +66,12 @@ parser.add_argument('--max_samples', type=int, default=None, help='Maximum numbe
 # ======================================================
 parser.add_argument('--beta', type=float, default=0.1, help='Weight for contrastive loss in total loss')
 parser.add_argument('--margin', type=float, default=0.2, help='Margin for TripleLoss')
+# 在 main.py 的 argparse 部分加入这行
+parser.add_argument('--use_correlation', action='store_true', help='Use correlation model and loss (End-to-End training)')
 
 args = parser.parse_args()
-args.data_path = "/root/CH-SIMS"
-args.dataset = "ch_sims"
+# args.data_path = "/root/CH-SIMS"
+# args.dataset = "ch_sims"
 
 torch.manual_seed(args.seed)
 dataset = str.lower(args.dataset.strip())
@@ -229,7 +231,7 @@ hyp_params.n_train, hyp_params.n_valid, hyp_params.n_test = len(train_data), len
 hyp_params.model = str.upper(args.model.strip())
 hyp_params.output_dim = output_dim_dict.get(dataset, 1)
 hyp_params.criterion = criterion_dict.get(dataset, 'L1Loss')
-hyp_params.criterion = 'MSELoss'
+# hyp_params.criterion = 'MSELoss'
 
 # 预训练模型路径 (End-to-End 模式下作为初始化权重)
 if hyp_params.dataset == "mosei_senti":
@@ -245,7 +247,7 @@ hyp_params.v_len = min(hyp_params.v_len, predefined_max_len)
 hyp_params.use_correlation = True 
 
 current_time = datetime.now().strftime("%Y%m%d_%H")
-hyp_params.name = ("CorMulT" if hyp_params.use_correlation else "MulT") + "_" + current_time
+hyp_params.name = ("DyCoTri" if hyp_params.use_correlation else "MulT") + "_" + current_time
 
 # ======================================================
 # 修改 3: 确保所有 Loader 使用正确的 Collate Fn
