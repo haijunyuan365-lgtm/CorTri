@@ -269,7 +269,7 @@ class MULTModel(nn.Module):
         # =====================================================
         C_cube_stream1 = None # [B, T, T, T] (Q=L, K=A, V=V) -> L, A, V
         C_cube_stream2 = None # [B, T, T, T] (Q=L, K=V, V=A) -> L, V, A
-        
+        F_T_pp, F_A_pp, F_V_pp = None, None, None
         if self.use_correlation:
             # 获取序列特征 [B, T, D_out]
             # 注意：此处不再使用 torch.no_grad()，实现端到端训练

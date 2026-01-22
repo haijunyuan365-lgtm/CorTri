@@ -27,11 +27,13 @@ def initiate(hyp_params, train_loader, valid_loader, test_loader):
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=hyp_params.when, factor=0.1, verbose=True)
     
+    # 将 best_valid 初始值设为 -1 (因为我们要找最大的 F1)
     settings = {'model': model,
                 'optimizer': optimizer,
                 'criterion': criterion,
                 'contrastive_criterion': contrastive_criterion,
-                'scheduler': scheduler}
+                'scheduler': scheduler,
+                'best_valid': -1}
     
     return train_model(settings, hyp_params, train_loader, valid_loader, test_loader)
 
@@ -75,6 +77,9 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
     contrastive_criterion = settings['contrastive_criterion']
     scheduler = settings['scheduler']
     
+    # 获取历史最佳指标
+    best_valid = settings.get('best_valid', -1)
+    
     beta = hyp_params.beta if hasattr(hyp_params, 'beta') else 0.1 
 
     def train(model, optimizer, criterion, contrastive_criterion, epoch):
@@ -113,18 +118,40 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
             
             batch_size = text.size(0)
             
-            # === 前向传播 ===
-            preds, _, seq_features = model(text, audio, vision)
-            F_T, F_A, F_V = seq_features
-
-            if isinstance(model, nn.DataParallel):
-                corr_module = model.module.corr_model
-            else:
-                corr_module = model.corr_model
+            # =================================================================
+            # 核心修改：增加 use_correlation 开关判断逻辑
+            # =================================================================
             
-            F_T_n, F_A_n, F_V_n = corr_module(text_neg, audio_neg, vision_neg)
+            # 1. 前向传播
+            outputs = model(text, audio, vision)
+            # outputs[0] 是预测值, outputs[2] 是序列特征(仅在开启correlation时有效)
+            preds = outputs[0] 
+            
+            # 初始化对比损失为 0
+            contrastive_loss = torch.tensor(0.0).to(preds.device)
 
-            # === 计算 Loss ===
+            # 2. 如果开启了 Correlation，则计算对比损失
+            if hyp_params.use_correlation:
+                _, _, seq_features = outputs
+                F_T, F_A, F_V = seq_features
+
+                # 获取 correlation_model (处理 DataParallel 情况)
+                if isinstance(model, nn.DataParallel):
+                    corr_module = model.module.corr_model
+                else:
+                    corr_module = model.corr_model
+                
+                # 计算负样本特征
+                F_T_n, F_A_n, F_V_n = corr_module(text_neg, audio_neg, vision_neg)
+
+                # 计算三元组损失
+                loss_A = contrastive_criterion(F_A, F_T, F_T_n) + contrastive_criterion(F_A, F_V, F_V_n)
+                loss_T = contrastive_criterion(F_T, F_A, F_A_n) + contrastive_criterion(F_T, F_V, F_V_n)
+                loss_V = contrastive_criterion(F_V, F_A, F_A_n) + contrastive_criterion(F_V, F_T, F_T_n)
+                
+                contrastive_loss = (loss_A + loss_T + loss_V) / 3.0
+
+            # 3. 计算 Task Loss (情感预测损失)
             if hyp_params.dataset == 'iemocap':
                 preds = preds.view(-1, 2)
                 eval_attr = eval_attr.view(-1)
@@ -134,12 +161,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
             
             task_loss = criterion(preds, eval_attr)
 
-            loss_A = contrastive_criterion(F_A, F_T, F_T_n) + contrastive_criterion(F_A, F_V, F_V_n)
-            loss_T = contrastive_criterion(F_T, F_A, F_A_n) + contrastive_criterion(F_T, F_V, F_V_n)
-            loss_V = contrastive_criterion(F_V, F_A, F_A_n) + contrastive_criterion(F_V, F_T, F_T_n)
-            
-            contrastive_loss = (loss_A + loss_T + loss_V) / 3.0
-
+            # 4. 总损失
             combined_loss = task_loss + beta * contrastive_loss
             
             combined_loss.backward()
@@ -189,7 +211,9 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
                             eval_attr = eval_attr.long()
                 
                 batch_size = text.size(0)
-                preds, _, _ = model(text, audio, vision)
+                # 评估时只取预测结果，不需要 Correlation 特征
+                outputs = model(text, audio, vision)
+                preds = outputs[0]
                 
                 if hyp_params.dataset == 'iemocap':
                     preds = preds.view(-1, 2)
@@ -212,7 +236,6 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         truths = torch.cat(truths)
         return avg_loss, results, truths
 
-    best_valid = -1
     
     # === 打印漂亮的表头 ===
     print("\n" + "="*95)
@@ -243,12 +266,8 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         print(f"{'':^6} | {'Test':^5}  | {test_loss:.4f}   | {t_mae:.4f}   | {t_acc7:.4f}   | {t_acc2:.4f}   | {t_f1:.4f}   |")
         print("-" * 95)
         
-        # if val_loss < best_valid:
-        #     print(f"Saved best model! (Val Loss: {val_loss:.4f})")
-        #     os.makedirs('pre_trained_models', exist_ok=True)
-        #     torch.save(model.state_dict(), f'pre_trained_models/{hyp_params.name}.pt')
-        #     best_valid = val_loss
-        if v_f1 > best_valid:  # 如果当前 F1 分数比历史最高还高
+        # === 核心修改：使用 F1 Score 来保存最佳模型 ===
+        if v_f1 > best_valid:  
             print(f"Saved best model! (Val F1: {v_f1:.4f} | Acc: {v_acc2:.4f})")
             os.makedirs('pre_trained_models', exist_ok=True)
             torch.save(model.state_dict(), f'pre_trained_models/{hyp_params.name}.pt')
