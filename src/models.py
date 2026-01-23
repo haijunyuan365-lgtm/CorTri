@@ -116,7 +116,7 @@ class TrimodalMultiheadAttention(nn.Module):
         # 只有当 T_q == T_k 时这行代码才成立 (Square matrix)。
         # 假设: 在 TriSAT 中所有模态都被对齐或 Padding 到相同长度 (seq_len)。
         
-        attn = torch.bmm(fused_weights, v) 
+        attn = torch.bmm(fused_weights, q)
         
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
