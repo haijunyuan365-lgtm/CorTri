@@ -253,10 +253,22 @@ class MULTModel(nn.Module):
         # 随着训练，优化器会根据梯度自动调整这个值（如果 Bias 变得有用）。
         self.lambda_param = nn.Parameter(torch.tensor(0.0))
         # 5. Output Layers
-        combined_dim = 2 * self.d_model
-        self.proj1 = nn.Linear(combined_dim, combined_dim)
-        self.proj2 = nn.Linear(combined_dim, combined_dim)
-        self.out_layer = nn.Linear(combined_dim, self.output_dim)
+        # combined_dim = 2 * self.d_model
+        # self.proj1 = nn.Linear(combined_dim, combined_dim)
+        # self.proj2 = nn.Linear(combined_dim, combined_dim)
+        # self.out_layer = nn.Linear(combined_dim, self.output_dim)
+        
+        # === 新增 TriSAT 风格的 GRU 输出层 ===
+        # TriSAT 的 GRU 输入维度是两个流的拼接，所以是 2 * d_model
+        self.gru = nn.GRU(
+            input_size=2 * self.d_model, 
+            hidden_size=self.d_model, # TriSAT 中 hidden_size 通常设为 total_proj_dim，这里我们可以设为 d_model 或 2*d_model
+            batch_first=False  # 注意：TriSAT 的 tensor 形状通常是 [Seq, Batch, Dim]，这里保持 False
+        )
+        
+        # 最终分类层
+        self.output_layer = nn.Linear(self.d_model, self.output_dim) 
+        # 注意：如果 GRU hidden_size 设为了 2*d_model，这里也要相应改为 2*d_model
 
     # forward 方法保持不变...
     def forward(self, x_l, x_a, x_v):
@@ -344,14 +356,21 @@ class MULTModel(nn.Module):
                          correlation_bias=C_cube_stream2, 
                          lambda_param=self.lambda_param)
 
-        # 融合
-        last_hs = torch.cat([h_s1[-1], h_s2[-1]], dim=1) # 取最后一个时间步 [B, 2*D]
+        # 1. 拼接双流的完整序列 
+        # h_s1: [T, B, D], h_s2: [T, B, D] -> h_t: [T, B, 2*D]
+        h_t = torch.cat((h_s1, h_s2), dim=-1) 
+
+        # 2. 通过 GRU 聚合时序信息
+        # GRU 输出: output, h_n
+        # output: [T, B, Hidden], h_n: [Num_Layers, B, Hidden]
+        _, h_n = self.gru(h_t) 
         
-        # 残差与输出
-        last_hs_proj = self.proj2(F.dropout(F.relu(self.proj1(last_hs)), p=self.out_dropout, training=self.training))
-        last_hs_proj += last_hs
+        # h_n 是最后一个时间步的隐状态，形状为 [1, B, Hidden] (假设单层 GRU)
+        # 移除第一维
+        last_hs = h_n.squeeze(0) # [B, Hidden]
+
+        # 3. 最终分类
+        output = self.output_layer(last_hs)
         
-        output = self.out_layer(last_hs_proj)
-        
-        # 返回 output 和 last_hs (保持接口一致)
+        # 返回 output 和 last_hs (保持接口一致，last_hs 用于可能的对比学习或其他用途)
         return output, last_hs, (F_T_pp, F_A_pp, F_V_pp)

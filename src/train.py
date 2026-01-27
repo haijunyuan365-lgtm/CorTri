@@ -80,7 +80,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
     # 获取历史最佳指标
     best_valid = settings.get('best_valid', -1)
     
-    beta = hyp_params.beta if hasattr(hyp_params, 'beta') else 0.1 
+    beta = hyp_params.beta if hasattr(hyp_params, 'beta') else 0.3 
 
     def train(model, optimizer, criterion, contrastive_criterion, epoch):
         epoch_loss = 0
