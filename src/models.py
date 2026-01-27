@@ -1,4 +1,3 @@
-# 文件: src/models.py
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -6,6 +5,10 @@ import math
 import os
 from modules.transformer import TransformerEncoder
 from modality_correlation.correlation_models import CorrelationModel
+
+# ==============================================================================
+# Part 1: 支持 Mask 的 TriSAT 核心组件
+# ==============================================================================
 
 class TrimodalMultiheadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, attn_dropout=0., bias=True):
@@ -30,46 +33,86 @@ class TrimodalMultiheadAttention(nn.Module):
             nn.init.constant_(self.in_proj_bias, 0.)
             nn.init.constant_(self.out_proj.bias, 0.)
 
-    def forward(self, query, key, value, correlation_bias=None, lambda_param=1.0):
+    def forward(self, query, key, value, key_padding_mask=None, value_padding_mask=None, correlation_bias=None, lambda_param=1.0):
+        """
+        key_padding_mask: [B, T_k] (True=Valid, False=Padding)
+        value_padding_mask: [B, T_v] (True=Valid, False=Padding)
+        """
         tgt_len, bsz, embed_dim = query.size()
         src_len_k = key.size(0)
         src_len_v = value.size(0)
 
+        # Projections
         q = F.linear(query, self.in_proj_weight[:embed_dim], self.in_proj_bias[:embed_dim] if self.in_proj_bias is not None else None)
         k = F.linear(key, self.in_proj_weight[embed_dim:2*embed_dim], self.in_proj_bias[embed_dim:2*embed_dim] if self.in_proj_bias is not None else None)
         v = F.linear(value, self.in_proj_weight[2*embed_dim:], self.in_proj_bias[2*embed_dim:] if self.in_proj_bias is not None else None)
         
         q = q * self.scaling
 
+        # [T, B, D] -> [B, Head, T, D] -> [B*Head, T, D]
         q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         k = k.contiguous().view(src_len_k, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         v = v.contiguous().view(src_len_v, bsz * self.num_heads, self.head_dim).transpose(0, 1)
 
-        # S_ijk = sum(Q_in * K_jn * V_kn)
+        # === [核心去噪 1] 输入级 Masking ===
+        # 将 Padding 的 Key 和 Value 强制置 0，防止 padding 参与 einsum 计算产生非零噪声
+        if key_padding_mask is not None:
+            # key_mask: [B, T_k] -> expand -> [B*H, T_k, 1]
+            k_mask = key_padding_mask.view(bsz, 1, src_len_k, 1).repeat(1, self.num_heads, 1, 1).view(bsz * self.num_heads, src_len_k, 1)
+            k = k.masked_fill(~k_mask, 0.0)
+            
+        if value_padding_mask is not None:
+            # value_mask: [B, T_v] -> expand -> [B*H, T_v, 1]
+            v_mask = value_padding_mask.view(bsz, 1, src_len_v, 1).repeat(1, self.num_heads, 1, 1).view(bsz * self.num_heads, src_len_v, 1)
+            v = v.masked_fill(~v_mask, 0.0)
+
+        # 1. 原始注意力分数 [B*H, T_q, T_k, T_v]
         attn_weights = torch.einsum('iat,ibt,ict->iabc', q, k, v) 
 
-        # 注入物理相关性偏置
+        # 2. 注入物理相关性偏置
         if correlation_bias is not None:
             bias_expanded = correlation_bias.unsqueeze(1).repeat(1, self.num_heads, 1, 1, 1)
-            # 确保 bias 形状匹配 [B*H, T_q, T_k, T_v]
             bias_expanded = bias_expanded.view(bsz * self.num_heads, tgt_len, src_len_k, src_len_v)
             attn_weights = attn_weights + lambda_param * bias_expanded
 
-        # TriSAT Fusion: Mean + Max
-        avg_score = torch.mean(attn_weights, dim=-1, keepdim=True)
+        # 3. TriSAT Fusion: 压缩 T_v 维度
+        # === [核心去噪 2] 智能平均 (Smart Mean) ===
+        # 如果直接 mean(dim=-1)，分母是 400，会极大稀释信号。
+        # 我们需要：sum(weights) / valid_length
+        sum_score = torch.sum(attn_weights, dim=-1, keepdim=True) # [B*H, T_q, T_k, 1]
+        
+        if value_padding_mask is not None:
+            # 计算每个样本的有效长度
+            valid_lens = value_padding_mask.sum(dim=1).float() # [B]
+            # 避免除以 0
+            valid_lens = valid_lens.masked_fill(valid_lens == 0, 1.0)
+            # 扩展到 [B*H, 1, 1, 1]
+            scale = valid_lens.view(bsz, 1, 1, 1).repeat(1, self.num_heads, tgt_len, src_len_k).view(bsz * self.num_heads, tgt_len, src_len_k, 1)
+            avg_score = sum_score / scale
+        else:
+            avg_score = torch.mean(attn_weights, dim=-1, keepdim=True)
+
+        # Max Pooling (0 填充不影响 max，除非全是负数，但这里是 logits 所以 0 可能是中间值)
+        # 为保险起见，我们假设 padding 产生的分数接近 0 (因为输入置0了)，而有效分数通常有正有负
         max_score = torch.max(attn_weights, dim=-1, keepdim=True)[0]
+        
         fused_weights = avg_score + max_score
         fused_weights = fused_weights.squeeze(-1) # [B*Heads, T_q, T_k]
+
+        # === [核心去噪 3] Key Masking ===
+        # 屏蔽掉 Padding 的 Audio (Key)
+        if key_padding_mask is not None:
+            # mask: [B, T_k] -> [B*H, T_q, T_k]
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            mask = mask.repeat(1, self.num_heads, tgt_len, 1)
+            mask = mask.view(bsz * self.num_heads, tgt_len, src_len_k)
+            
+            fused_weights = fused_weights.masked_fill(~mask, -1e9)
 
         fused_weights = F.softmax(fused_weights.float(), dim=-1).type_as(fused_weights)
         fused_weights = F.dropout(fused_weights, p=self.attn_dropout, training=self.training)
 
-        # =================================================================
-        # [关键修改] 改回标准的 Attention 逻辑：乘 v
-        # =================================================================
-        # fused_weights: [B*H, T_q(50), T_k(400)]
-        # v:             [B*H, T_v(400), D]
-        # Result:        [B*H, T_q(50), D]  <-- 维度完美匹配！
+        # 4. 加权求和 (乘 V)
         attn = torch.bmm(fused_weights, v)
         
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
@@ -88,20 +131,18 @@ class TriSATEncoderLayer(nn.Module):
         
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
-        # 兼容性处理：如果只传入一个 tensor，也要能处理
-        # TriSAT 中 x_k, x_v 来源不同，所以 norm 应该分开定义，或者共享参数取决于设计
-        # 这里假设输入已经 Norm 过，或者由 Layer 内部 Norm
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, x_k, x_v, correlation_bias=None, lambda_param=1.0):
+    def forward(self, x, x_k, x_v, key_padding_mask=None, value_padding_mask=None, correlation_bias=None, lambda_param=1.0):
         residual = x
         x = self.norm1(x)
-        # 注意: x_k, x_v 通常是其他模态，是否Norm取决于架构，TriSAT源码里似乎是在输入前Norm的
-        # 为了保险，我们在这里对 Key/Value 也做个 Norm (如果维度相同)
-        # 但考虑到 x_k/x_v 可能已经经过了 layer norm，这里简单起见只 norm x (Query)
         
-        x2 = self.self_attn(query=x, key=x_k, value=x_v, correlation_bias=correlation_bias, lambda_param=lambda_param)
+        x2 = self.self_attn(query=x, key=x_k, value=x_v, 
+                            key_padding_mask=key_padding_mask,
+                            value_padding_mask=value_padding_mask,
+                            correlation_bias=correlation_bias, 
+                            lambda_param=lambda_param)
         x = residual + self.dropout1(x2)
 
         residual = x
@@ -112,7 +153,7 @@ class TriSATEncoderLayer(nn.Module):
 
 dataset_specific_configs = {
     "mosei_senti": {
-        "text_in_dim": 768,
+        "text_in_dim": 300,
         "audio_in_dim": 74,
         "vision_in_dim": 35,
         "d_model": 128,
@@ -183,11 +224,6 @@ class MULTModel(nn.Module):
         self.w_va = nn.Parameter(torch.tensor(0.33))
         self.w_av = nn.Parameter(torch.tensor(0.33))
         
-        # =================================================================
-        # [关键修改] 初始 lambda 改为 1.0
-        # =================================================================
-        # 既然在 Stage 2 我们冻结了 Correlation Model，说明我们信任它。
-        # 让模型一上来就完全接收 Bias，能加速 Unaligned 数据的对齐学习。
         self.lambda_param = nn.Parameter(torch.tensor(1.0))
 
         combined_dim = 2 * self.d_model
@@ -196,7 +232,13 @@ class MULTModel(nn.Module):
         self.out_layer = nn.Linear(combined_dim, self.output_dim)
 
     def forward(self, x_l, x_a, x_v):
-        B = x_l.size(0)
+        # =================================================================
+        # [生成 Mask]
+        # x_a: [B, T_a, D] -> sum(dim=2) != 0 -> [B, T_a]
+        # =================================================================
+        mask_a = (torch.sum(x_a, dim=2) != 0) 
+        mask_v = (torch.sum(x_v, dim=2) != 0)
+
         C_cube_stream1 = None 
         C_cube_stream2 = None
         
@@ -232,15 +274,23 @@ class MULTModel(nn.Module):
         proj_a = self.proj_a(x_a_p).permute(2, 0, 1)
         proj_v = self.proj_v(x_v_p).permute(2, 0, 1)
 
+        # Stream 1: Key=Audio, Value=Video
+        # 传入 key_mask=Audio, value_mask=Video
         h_s1 = proj_l
         for layer in self.trisat_stream1:
             h_s1 = layer(h_s1, proj_a, proj_v, 
+                         key_padding_mask=mask_a, 
+                         value_padding_mask=mask_v,
                          correlation_bias=C_cube_stream1, 
                          lambda_param=self.lambda_param)
 
+        # Stream 2: Key=Video, Value=Audio
+        # 传入 key_mask=Video, value_mask=Audio
         h_s2 = proj_l
         for layer in self.trisat_stream2:
             h_s2 = layer(h_s2, proj_v, proj_a, 
+                         key_padding_mask=mask_v, 
+                         value_padding_mask=mask_a,
                          correlation_bias=C_cube_stream2, 
                          lambda_param=self.lambda_param)
 
