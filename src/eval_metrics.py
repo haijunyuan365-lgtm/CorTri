@@ -4,7 +4,7 @@ from sklearn.metrics import classification_report
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import accuracy_score, f1_score
-
+from scipy.stats import pearsonr  # <--- 第一步：新增这行引用
 
 def multiclass_acc(preds, truths):
     return np.sum(np.round(preds) == np.round(truths)) / float(len(truths))
@@ -41,6 +41,16 @@ def eval_ch_sims(results: torch.Tensor,
     print("F1 score: ", f_score)
     print("Accuracy: ", accuracy_score(binary_truth, binary_preds))
 
+    # ================= 第二步：CH-SIMS 新增计算部分 =================
+    # 计算 Pearson Correlation
+    corr, _ = pearsonr(test_preds, test_truth)
+    # 计算 MAE (Mean Absolute Error)
+    mae = np.mean(np.abs(test_preds - test_truth))
+    
+    print("MAE: ", mae)  # <--- 新增
+    print("Corr: ", corr) # <--- 新增
+    # ==============================================================
+
     print("-" * 50)
 
 def eval_mosei_senti(results, truths, exclude_zero=False):
@@ -64,5 +74,15 @@ def eval_mosei_senti(results, truths, exclude_zero=False):
     print("mult_acc_5: ", mult_a5)
     print("F1 score: ", f_score)
     print("Accuracy: ", accuracy_score(binary_truth, binary_preds))
+
+    # ================= 第三步：MOSEI/MOSI 新增计算部分 =================
+    # 计算 Pearson Correlation
+    corr, _ = pearsonr(test_preds, test_truth)
+    # 计算 MAE (Mean Absolute Error)
+    mae = np.mean(np.abs(test_preds - test_truth))
+    
+    print("MAE: ", mae)  # <--- 新增
+    print("Corr: ", corr) # <--- 新增
+    # ================================================================
 
     print("-" * 50)

@@ -42,7 +42,7 @@ parser.add_argument('--num_heads', type=int, default=2, help='number of heads fo
 parser.add_argument('--attn_mask', action='store_false', help='use attention mask for Transformer (default: true)')
 
 # Tuning
-parser.add_argument('--batch_size', type=int, default=48, metavar='N', help='batch size (default: 24)')
+parser.add_argument('--batch_size', type=int, default=32, metavar='N', help='batch size (default: 24)')
 parser.add_argument('--clip', type=float, default=0.8, help='gradient clip value (default: 0.8)')
 parser.add_argument('--lr', type=float, default=3 * 1e-4, help='initial learning rate (default: 3 * 1e-4)')
 parser.add_argument('--optim', type=str, default='Adam', help='optimizer to use (default: Adam)')
@@ -64,11 +64,10 @@ parser.add_argument('--max_samples', type=int, default=None, help='Maximum numbe
 # ======================================================
 # 新增: 端到端训练需要的超参数
 # ======================================================
-parser.add_argument('--beta', type=float, default=0.1, help='Weight for contrastive loss in total loss')
+parser.add_argument('--beta', type=float, default=0, help='Weight for contrastive loss in total loss')
 parser.add_argument('--margin', type=float, default=0.2, help='Margin for TripleLoss')
 # 在 main.py 的 argparse 部分加入这行
-parser.add_argument('--use_correlation', default=False, action='store_true', help='Use correlation model and loss (End-to-End training)')
-
+parser.add_argument('--use_correlation', default=True, action='store_true', help='Use correlation model and loss (End-to-End training)')
 args = parser.parse_args()
 # args.data_path = "/root/CH-SIMS"
 # args.dataset = "ch_sims"
@@ -114,7 +113,7 @@ print(gpustat.print_gpustat())
 print("Start loading the data....")
 
 # ======================================================
-# 修改 1: 开启 for_correlation=True 以生成负样本
+# 修改 1: 关闭 for_correlation 
 # ======================================================
 train_data = UnifiedMultimodalDataset(
     dataset_path=args.data_path,
@@ -122,7 +121,7 @@ train_data = UnifiedMultimodalDataset(
     split_type='train',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=True,  # 关键修改：开启负样本生成
+    for_correlation=False, 
     perturbation_ratio=0.3,
     noise_std=0.05
 )
@@ -136,7 +135,7 @@ valid_data = UnifiedMultimodalDataset(
     split_type='valid',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=True, # 关键修改
+    for_correlation=False, # 关键修改
     perturbation_ratio=0.3,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
@@ -151,7 +150,7 @@ test_data = UnifiedMultimodalDataset(
     split_type='test',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=True, # 关键修改
+    for_correlation=False, # 关键修改
     perturbation_ratio=0,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
@@ -160,51 +159,42 @@ test_data = UnifiedMultimodalDataset(
 print("test data loaded")
 print(gpustat.print_gpustat())
 
-# ======================================================
-# 修改 2: 更新 Collate Function 以处理负样本
-# ======================================================
+# main.py 修改建议
+
 def get_collate_fn(hyp_params):
     def collate_fn(batch):
         """
-        处理 for_correlation=True 时的 batch 数据结构:
-        batch item: ((meta, text, audio, vision), (text_neg, audio_neg, vision_neg), label, META_ORIG)
+        Stage 2 专用 collate_fn:
+        只处理正样本 (Meta, Text, Audio, Vision, Label)
         """
         max_text_len = hyp_params.l_len
         max_audio_len = hyp_params.a_len
         max_vision_len = hyp_params.v_len
 
-        # 提取数据
-        metas = [item[0][0] for item in batch]
+        # batch item 结构 (for_correlation=False 时):
+        # ((meta, text, audio, vision), label, (meta,))
         
-        # 正样本截断
+        # 1. 提取 Meta 和 Label
+        metas = [item[0][0] for item in batch]
+        labels = [item[1] for item in batch] # 注意：label 在索引 1
+
+        # 2. 提取并截断特征
         texts = [item[0][1][:max_text_len] for item in batch]
         audios = [item[0][2][:max_audio_len] for item in batch]
         visions = [item[0][3][:max_vision_len] for item in batch]
         
-        # 负样本截断
-        texts_neg = [item[1][0][:max_text_len] for item in batch]
-        audios_neg = [item[1][1][:max_audio_len] for item in batch]
-        visions_neg = [item[1][2][:max_vision_len] for item in batch]
-        
-        labels = [item[2] for item in batch]
-
-        # Padding (正样本)
+        # 3. Padding (仅正样本)
         texts_padded = pad_sequence(texts, batch_first=True)
         audios_padded = pad_sequence(audios, batch_first=True)
         visions_padded = pad_sequence(visions, batch_first=True)
-        
-        # Padding (负样本)
-        texts_neg_padded = pad_sequence(texts_neg, batch_first=True)
-        audios_neg_padded = pad_sequence(audios_neg, batch_first=True)
-        visions_neg_padded = pad_sequence(visions_neg, batch_first=True)
 
-        # Labels
+        # 4. Label Stack
         labels_tensor = torch.stack(labels).squeeze(-1) 
 
-        # 返回符合 src/train.py 期望的 Flat Tuple (8个元素)
+        # 5. 返回精简的 Tuple (5个元素)
+        # 对应 src/train.py 中的解包逻辑
         return (metas, 
                 texts_padded, audios_padded, visions_padded, 
-                texts_neg_padded, audios_neg_padded, visions_neg_padded, 
                 labels_tensor)
                 
     return collate_fn
@@ -233,9 +223,9 @@ hyp_params.output_dim = output_dim_dict.get(dataset, 1)
 hyp_params.criterion = criterion_dict.get(dataset, 'L1Loss')
 hyp_params.criterion = 'MSELoss'
 
-# 预训练模型路径 (End-to-End 模式下作为初始化权重)
+# 预训练模型路径
 if hyp_params.dataset == "mosei_senti":
-    hyp_params.corr_model_path = "/root/CorMulT/Correlation-Aware-Multimodal-Transformer/pre_trained_models/correlation_model012409.pt"
+    hyp_params.corr_model_path = "/root/CorTri/pre_trained_models/correlation_model.pt"
 elif hyp_params.dataset == "ch_sims":
     hyp_params.corr_model_path = "/root/CorMulT/Correlation-Aware-Multimodal-Transformer/pre_trained_models/correlation_model_ch_sims.pt"
 

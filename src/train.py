@@ -22,7 +22,7 @@ def initiate(hyp_params, train_loader, valid_loader, test_loader):
     optimizer = getattr(optim, hyp_params.optim)(model.parameters(), lr=hyp_params.lr)
     criterion = getattr(nn, hyp_params.criterion)()
     
-    # 初始化对比损失函数
+    # 初始化对比损失函数 (Stage 2 不需要，但为了代码兼容性保留初始化，不调用即可)
     contrastive_criterion = TripleLoss(margin=hyp_params.margin if hasattr(hyp_params, 'margin') else 0.2)
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=hyp_params.when, factor=0.1, verbose=True)
@@ -80,6 +80,8 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
     # 获取历史最佳指标
     best_valid = settings.get('best_valid', -1)
     
+    # 获取 beta，如果没有定义默认为 0.1
+    # [Stage 2 重要提示] 这里的 beta 应该在 main.py 里设为 0
     beta = hyp_params.beta if hasattr(hyp_params, 'beta') else 0.1 
 
     def train(model, optimizer, criterion, contrastive_criterion, epoch):
@@ -90,10 +92,17 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         start_time = time.time()
         
         for i_batch, batch_data in enumerate(train_loader):
-            # === 数据解包 (保持你的鲁棒逻辑) ===
+            # =================================================================
+            # 1. 数据解包 (兼容 Stage 2 的 5 元素格式)
+            # =================================================================
+            text_neg, audio_neg, vision_neg = None, None, None
             try:
-                if len(batch_data) == 8:
-                    metas, text, audio, vision, text_neg, audio_neg, vision_neg, eval_attr = batch_data
+                if len(batch_data) == 5: 
+                    # [Stage 2] 标准格式: (metas, text, audio, vision, label)
+                    metas, text, audio, vision, eval_attr = batch_data
+                elif len(batch_data) >= 8:
+                    # [Stage 1 / Legacy] 包含负样本
+                    metas, text, audio, vision, text_neg, audio_neg, vision_neg, eval_attr = batch_data[:8]
                 elif len(batch_data) == 2:
                     inputs, eval_attr = batch_data
                     if len(inputs) == 7:
@@ -101,9 +110,9 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
                     else:
                         raise ValueError("Batch input size unexpected.")
                 else:
-                    raise ValueError("Unknown batch structure.")
-            except ValueError:
-                 print("Error: DataLoader must provide negative samples for End-to-End training!")
+                    raise ValueError(f"Unknown batch structure with length {len(batch_data)}")
+            except ValueError as e:
+                 print(f"Error in unpacking: {e}")
                  sys.exit(1)
 
             model.zero_grad()
@@ -111,47 +120,61 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
             if hyp_params.use_cuda:
                 with torch.cuda.device(0):
                     text, audio, vision = text.cuda(), audio.cuda(), vision.cuda()
-                    text_neg, audio_neg, vision_neg = text_neg.cuda(), audio_neg.cuda(), vision_neg.cuda()
                     eval_attr = eval_attr.cuda()
+                    
+                    # 只有在存在负样本时才转 GPU
+                    if text_neg is not None:
+                        text_neg, audio_neg, vision_neg = text_neg.cuda(), audio_neg.cuda(), vision_neg.cuda()
+                    
                     if hyp_params.dataset == 'iemocap':
                         eval_attr = eval_attr.long()
             
             batch_size = text.size(0)
             
             # =================================================================
-            # 核心修改：增加 use_correlation 开关判断逻辑
+            # 2. 前向传播
             # =================================================================
-            
-            # 1. 前向传播
+            # Stage 2 Model 返回 (preds, last_hs)，长度为 2
+            # Stage 1 Model 返回 (preds, last_hs, seq_features)，长度为 3
             outputs = model(text, audio, vision)
-            # outputs[0] 是预测值, outputs[2] 是序列特征(仅在开启correlation时有效)
             preds = outputs[0] 
             
-            # 初始化对比损失为 0
             contrastive_loss = torch.tensor(0.0).to(preds.device)
 
-            # 2. 如果开启了 Correlation，则计算对比损失
-            if hyp_params.use_correlation:
-                _, _, seq_features = outputs
-                F_T, F_A, F_V = seq_features
+            # =================================================================
+            # 3. 对比损失计算 
+            #    [关键修改] 增加 beta > 0 的判断。
+            #    在 Stage 2 (beta=0) 时，彻底跳过此块，防止因返回值数量不匹配导致的解包错误。
+            # =================================================================
+            if hyp_params.use_correlation and beta > 0:
+                if len(outputs) >= 3:
+                    _, _, seq_features = outputs
+                    F_T, F_A, F_V = seq_features
 
-                # 获取 correlation_model (处理 DataParallel 情况)
-                if isinstance(model, nn.DataParallel):
-                    corr_module = model.module.corr_model
-                else:
-                    corr_module = model.corr_model
-                
-                # 计算负样本特征
-                F_T_n, F_A_n, F_V_n = corr_module(text_neg, audio_neg, vision_neg)
+                    # 获取 correlation_model
+                    if isinstance(model, nn.DataParallel):
+                        corr_module = model.module.corr_model
+                    else:
+                        corr_module = model.corr_model
+                    
+                    # 确保负样本存在 (Stage 2 colla_fn 不返回负样本，这里必须防御)
+                    if text_neg is not None:
+                        F_T_n, F_A_n, F_V_n = corr_module(text_neg, audio_neg, vision_neg)
 
-                # 计算三元组损失
-                loss_A = contrastive_criterion(F_A, F_T, F_T_n) + contrastive_criterion(F_A, F_V, F_V_n)
-                loss_T = contrastive_criterion(F_T, F_A, F_A_n) + contrastive_criterion(F_T, F_V, F_V_n)
-                loss_V = contrastive_criterion(F_V, F_A, F_A_n) + contrastive_criterion(F_V, F_T, F_T_n)
-                
-                contrastive_loss = (loss_A + loss_T + loss_V) / 3.0
+                        # 计算三元组损失
+                        loss_A = contrastive_criterion(F_A, F_T, F_T_n) + contrastive_criterion(F_A, F_V, F_V_n)
+                        loss_T = contrastive_criterion(F_T, F_A, F_A_n) + contrastive_criterion(F_T, F_V, F_V_n)
+                        loss_V = contrastive_criterion(F_V, F_A, F_A_n) + contrastive_criterion(F_V, F_T, F_T_n)
+                        
+                        contrastive_loss = (loss_A + loss_T + loss_V) / 3.0
+                    else:
+                        # 这是一个异常情况：想要算 loss 但没有负样本
+                        # 但如果不报错，就让 contrastive_loss 保持 0
+                        pass
 
-            # 3. 计算 Task Loss (情感预测损失)
+            # =================================================================
+            # 4. 任务损失 & 总损失
+            # =================================================================
             if hyp_params.dataset == 'iemocap':
                 preds = preds.view(-1, 2)
                 eval_attr = eval_attr.view(-1)
@@ -161,8 +184,11 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
             
             task_loss = criterion(preds, eval_attr)
 
-            # 4. 总损失
-            combined_loss = task_loss + beta * contrastive_loss
+            if beta > 0:
+                combined_loss = task_loss + beta * contrastive_loss
+            else:
+                # Stage 2: 纯净的任务损失
+                combined_loss = task_loss
             
             combined_loss.backward()
             
@@ -173,7 +199,6 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
             proc_size += batch_size
             epoch_loss += combined_loss.item() * batch_size
             
-            # === 详细的 Batch 日志 ===
             if i_batch % hyp_params.log_interval == 0 and i_batch > 0:
                 avg_loss = proc_loss / proc_size
                 elapsed_time = time.time() - start_time
@@ -195,14 +220,24 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
 
         with torch.no_grad():
             for i_batch, batch_data in enumerate(loader):
-                if len(batch_data) == 8:
-                    metas, text, audio, vision, _, _, _, eval_attr = batch_data
+                # =================================================================
+                # 数据解包 (同步 evaluate 的解包逻辑)
+                # =================================================================
+                if len(batch_data) == 5:
+                    # Stage 2
+                    metas, text, audio, vision, eval_attr = batch_data
+                elif len(batch_data) >= 8:
+                    # Stage 1 / Legacy
+                    metas, text, audio, vision, _, _, _, eval_attr = batch_data[:8]
                 elif len(batch_data) == 2:
                      inputs, eval_attr = batch_data
                      if len(inputs) == 7:
                         metas, text, audio, vision, _, _, _ = inputs
                      else:
                         metas, text, audio, vision = inputs
+                else:
+                    print(f"Warning: Unexpected batch shape {len(batch_data)} in evaluate")
+                    continue
                 
                 if hyp_params.use_cuda:
                     with torch.cuda.device(0):
@@ -211,7 +246,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
                             eval_attr = eval_attr.long()
                 
                 batch_size = text.size(0)
-                # 评估时只取预测结果，不需要 Correlation 特征
+                
                 outputs = model(text, audio, vision)
                 preds = outputs[0]
                 
@@ -266,7 +301,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         print(f"{'':^6} | {'Test':^5}  | {test_loss:.4f}   | {t_mae:.4f}   | {t_acc7:.4f}   | {t_acc2:.4f}   | {t_f1:.4f}   |")
         print("-" * 95)
         
-        # === 核心修改：使用 F1 Score 来保存最佳模型 ===
+        # === 使用 F1 Score 保存最佳模型 ===
         if v_f1 > best_valid:  
             print(f"Saved best model! (Val F1: {v_f1:.4f} | Acc: {v_acc2:.4f})")
             os.makedirs('pre_trained_models', exist_ok=True)
