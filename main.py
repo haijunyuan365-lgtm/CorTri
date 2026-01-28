@@ -44,9 +44,9 @@ parser.add_argument('--attn_mask', action='store_false', help='use attention mas
 # Tuning
 parser.add_argument('--batch_size', type=int, default=32, metavar='N', help='batch size (default: 24)')
 parser.add_argument('--clip', type=float, default=0.8, help='gradient clip value (default: 0.8)')
-parser.add_argument('--lr', type=float, default=3 * 1e-4, help='initial learning rate (default: 3 * 1e-4)')
-parser.add_argument('--optim', type=str, default='Adam', help='optimizer to use (default: Adam)')
-parser.add_argument('--num_epochs', type=int, default=20, help='number of epochs (default: 40)')
+parser.add_argument('--lr', type=float, default=1e-4, help='initial learning rate (default: 3 * 1e-4)')
+parser.add_argument('--optim', type=str, default='Adam',help='optimizer to use (default: Adam)')
+parser.add_argument('--num_epochs', type=int, default=10, help='number of epochs (default: 40)')
 parser.add_argument('--when', type=int, default=10, help='when to decay learning rate (default: 20)')
 parser.add_argument('--batch_chunk', type=int, default=1, help='number of chunks per batch (default: 1)')
 
@@ -60,7 +60,8 @@ parser.add_argument('--name', type=str, default='mult', help='name of the trial 
 parser.add_argument('--perturbation_ratio', type=float, default=0.0, help='Proportion of perturbed samples used in the training set')
 parser.add_argument('--sample_ratio', type=float, default=1.0, help='Proportion of data retained in the training set')
 parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples to use')
-
+# 在 Tuning 部分添加
+parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay (default: 1e-4)')
 # ======================================================
 # 新增: 端到端训练需要的超参数
 # ======================================================
@@ -122,7 +123,7 @@ train_data = UnifiedMultimodalDataset(
     if_align=args.aligned,
     max_samples=args.max_samples,
     for_correlation=False, 
-    perturbation_ratio=0.3,
+    perturbation_ratio=0,
     noise_std=0.05
 )
 
@@ -136,7 +137,7 @@ valid_data = UnifiedMultimodalDataset(
     if_align=args.aligned,
     max_samples=args.max_samples,
     for_correlation=False, # 关键修改
-    perturbation_ratio=0.3,
+    perturbation_ratio=0,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
 )
@@ -189,7 +190,7 @@ def get_collate_fn(hyp_params):
         visions_padded = pad_sequence(visions, batch_first=True)
 
         # 4. Label Stack
-        labels_tensor = torch.stack(labels).squeeze(-1) 
+        labels_tensor = torch.stack(labels).view(-1)
 
         # 5. 返回精简的 Tuple (5个元素)
         # 对应 src/train.py 中的解包逻辑
@@ -222,6 +223,8 @@ hyp_params.model = str.upper(args.model.strip())
 hyp_params.output_dim = output_dim_dict.get(dataset, 1)
 hyp_params.criterion = criterion_dict.get(dataset, 'L1Loss')
 hyp_params.criterion = 'MSELoss'
+# hyp_params.criterion = 'L1Loss'
+
 
 # 预训练模型路径
 if hyp_params.dataset == "mosei_senti":
@@ -250,11 +253,11 @@ train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, 
 
 print("before valid_loader")
 print(gpustat.print_gpustat())
-valid_loader = DataLoader(valid_data, batch_size=args.batch_size, shuffle=True, collate_fn=get_collate_fn(hyp_params))
+valid_loader = DataLoader(valid_data, batch_size=args.batch_size, shuffle=False, collate_fn=get_collate_fn(hyp_params))
 
 print("before test_loader")
 print(gpustat.print_gpustat())
-test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=True, collate_fn=get_collate_fn(hyp_params))
+test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, collate_fn=get_collate_fn(hyp_params))
 
 
 if __name__ == '__main__':

@@ -34,10 +34,6 @@ class TrimodalMultiheadAttention(nn.Module):
             nn.init.constant_(self.out_proj.bias, 0.)
 
     def forward(self, query, key, value, key_padding_mask=None, value_padding_mask=None, correlation_bias=None, lambda_param=1.0):
-        """
-        key_padding_mask: [B, T_k] (True=Valid, False=Padding)
-        value_padding_mask: [B, T_v] (True=Valid, False=Padding)
-        """
         tgt_len, bsz, embed_dim = query.size()
         src_len_k = key.size(0)
         src_len_v = value.size(0)
@@ -54,60 +50,73 @@ class TrimodalMultiheadAttention(nn.Module):
         k = k.contiguous().view(src_len_k, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         v = v.contiguous().view(src_len_v, bsz * self.num_heads, self.head_dim).transpose(0, 1)
 
-        # === [核心去噪 1] 输入级 Masking ===
-        # 将 Padding 的 Key 和 Value 强制置 0，防止 padding 参与 einsum 计算产生非零噪声
-        if key_padding_mask is not None:
-            # key_mask: [B, T_k] -> expand -> [B*H, T_k, 1]
-            k_mask = key_padding_mask.view(bsz, 1, src_len_k, 1).repeat(1, self.num_heads, 1, 1).view(bsz * self.num_heads, src_len_k, 1)
-            k = k.masked_fill(~k_mask, 0.0)
-            
-        if value_padding_mask is not None:
-            # value_mask: [B, T_v] -> expand -> [B*H, T_v, 1]
-            v_mask = value_padding_mask.view(bsz, 1, src_len_v, 1).repeat(1, self.num_heads, 1, 1).view(bsz * self.num_heads, src_len_v, 1)
-            v = v.masked_fill(~v_mask, 0.0)
+        # 注意：这里不需要再对 k, v 做输入级 masked_fill(0.0) 了，
+        # 因为我们会在 attn_weights 层面做更精细的 mask。
+        # 当然，为了计算稳定性，保留也无妨，但不起决定性作用。
 
         # 1. 原始注意力分数 [B*H, T_q, T_k, T_v]
         attn_weights = torch.einsum('iat,ibt,ict->iabc', q, k, v) 
 
         # 2. 注入物理相关性偏置
+        # 注意：Bias 可能在 Padding 处有垃圾值，所以必须在加完 Bias 后再 Mask！
         if correlation_bias is not None:
             bias_expanded = correlation_bias.unsqueeze(1).repeat(1, self.num_heads, 1, 1, 1)
             bias_expanded = bias_expanded.view(bsz * self.num_heads, tgt_len, src_len_k, src_len_v)
             attn_weights = attn_weights + lambda_param * bias_expanded
 
-        # 3. TriSAT Fusion: 压缩 T_v 维度
-        # === [核心去噪 2] 智能平均 (Smart Mean) ===
-        # 如果直接 mean(dim=-1)，分母是 400，会极大稀释信号。
-        # 我们需要：sum(weights) / valid_length
-        sum_score = torch.sum(attn_weights, dim=-1, keepdim=True) # [B*H, T_q, T_k, 1]
+        # =================================================================
+        # [关键修复] 归约前的双重 Masking
+        # =================================================================
         
-        if value_padding_mask is not None:
-            # 计算每个样本的有效长度
-            valid_lens = value_padding_mask.sum(dim=1).float() # [B]
-            # 避免除以 0
-            valid_lens = valid_lens.masked_fill(valid_lens == 0, 1.0)
-            # 扩展到 [B*H, 1, 1, 1]
-            scale = valid_lens.view(bsz, 1, 1, 1).repeat(1, self.num_heads, tgt_len, src_len_k).view(bsz * self.num_heads, tgt_len, src_len_k, 1)
+        # 准备 Mask 矩阵 [B*H, T_q, T_k, T_v]
+        # 我们主要关心 Key (dim=-2) 的 Mask，因为我们要在这个维度归约
+        mask_k_expanded = None
+        if key_padding_mask is not None:
+            # key_mask: [B, T_k] -> [B*H, 1, T_k, 1] -> expand
+            mask_k_expanded = key_padding_mask.view(bsz, 1, src_len_k, 1).repeat(1, self.num_heads, 1, 1).view(bsz * self.num_heads, 1, src_len_k, 1)
+            mask_k_expanded = mask_k_expanded.expand(-1, tgt_len, -1, src_len_v)
+
+        # --- 分支 A: 计算 Mean (Sum) ---
+        # 对于 Sum，Padding 必须是 0.0
+        if mask_k_expanded is not None:
+            attn_weights_for_sum = attn_weights.masked_fill(~mask_k_expanded, 0.0)
+        else:
+            attn_weights_for_sum = attn_weights
+
+        sum_score = torch.sum(attn_weights_for_sum, dim=-2, keepdim=True) # [B*H, T_q, 1, T_v]
+        
+        # 计算 Scale (分母)
+        if key_padding_mask is not None:
+            valid_lens_k = key_padding_mask.sum(dim=1).float()
+            valid_lens_k = valid_lens_k.masked_fill(valid_lens_k == 0, 1.0)
+            scale = valid_lens_k.view(bsz, 1, 1, 1).repeat(1, self.num_heads, tgt_len, src_len_v).view(bsz * self.num_heads, tgt_len, 1, src_len_v)
             avg_score = sum_score / scale
         else:
-            avg_score = torch.mean(attn_weights, dim=-1, keepdim=True)
+            avg_score = torch.mean(attn_weights, dim=-2, keepdim=True)
 
-        # Max Pooling (0 填充不影响 max，除非全是负数，但这里是 logits 所以 0 可能是中间值)
-        # 为保险起见，我们假设 padding 产生的分数接近 0 (因为输入置0了)，而有效分数通常有正有负
-        max_score = torch.max(attn_weights, dim=-1, keepdim=True)[0]
-        
-        fused_weights = avg_score + max_score
-        fused_weights = fused_weights.squeeze(-1) # [B*Heads, T_q, T_k]
-
-        # === [核心去噪 3] Key Masking ===
-        # 屏蔽掉 Padding 的 Audio (Key)
-        if key_padding_mask is not None:
-            # mask: [B, T_k] -> [B*H, T_q, T_k]
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            mask = mask.repeat(1, self.num_heads, tgt_len, 1)
-            mask = mask.view(bsz * self.num_heads, tgt_len, src_len_k)
+        # --- 分支 B: 计算 Max ---
+        # 对于 Max，Padding 必须是 -inf (避免 0.0 大于负数 logits)
+        if mask_k_expanded is not None:
+            attn_weights_for_max = attn_weights.masked_fill(~mask_k_expanded, -1.0e9)
+        else:
+            attn_weights_for_max = attn_weights
             
-            fused_weights = fused_weights.masked_fill(~mask, -1e9)
+        max_score = torch.max(attn_weights_for_max, dim=-2, keepdim=True)[0]
+        
+        # 融合
+        fused_weights = avg_score + max_score
+        fused_weights = fused_weights.squeeze(-2) # [B*Heads, T_q, T_v]
+
+        # =================================================================
+        # 输出级 Masking (Value Mask)
+        # =================================================================
+        if value_padding_mask is not None:
+            # mask: [B, T_v] -> [B*H, T_q, T_v]
+            mask_v = value_padding_mask.unsqueeze(1).unsqueeze(2)
+            mask_v = mask_v.repeat(1, self.num_heads, tgt_len, 1)
+            mask_v = mask_v.view(bsz * self.num_heads, tgt_len, src_len_v)
+            
+            fused_weights = fused_weights.masked_fill(~mask_v, -1e9)
 
         fused_weights = F.softmax(fused_weights.float(), dim=-1).type_as(fused_weights)
         fused_weights = F.dropout(fused_weights, p=self.attn_dropout, training=self.training)
@@ -230,14 +239,15 @@ class MULTModel(nn.Module):
         self.proj1 = nn.Linear(combined_dim, combined_dim)
         self.proj2 = nn.Linear(combined_dim, combined_dim)
         self.out_layer = nn.Linear(combined_dim, self.output_dim)
-
+    
     def forward(self, x_l, x_a, x_v):
         # =================================================================
         # [生成 Mask]
         # x_a: [B, T_a, D] -> sum(dim=2) != 0 -> [B, T_a]
         # =================================================================
-        mask_a = (torch.sum(x_a, dim=2) != 0) 
-        mask_v = (torch.sum(x_v, dim=2) != 0)
+        mask_l = (x_l.abs().sum(dim=2) > 0)   # [B, T_l]
+        mask_a = (x_a.abs().sum(dim=2) > 0)   # [B, T_a]
+        mask_v = (x_v.abs().sum(dim=2) > 0)   # [B, T_v]
 
         C_cube_stream1 = None 
         C_cube_stream2 = None
@@ -254,6 +264,16 @@ class MULTModel(nn.Module):
             C_TA = torch.bmm(F_T_norm, F_A_norm.transpose(1, 2))
             C_TV = torch.bmm(F_T_norm, F_V_norm.transpose(1, 2))
             C_AV = torch.bmm(F_A_norm, F_V_norm.transpose(1, 2)) 
+            
+            m_l = mask_l.float()
+            m_a = mask_a.float()
+            m_v = mask_v.float()
+            # [B, T_l, T_a]
+            C_TA = C_TA * (m_l.unsqueeze(2) * m_a.unsqueeze(1))
+            # [B, T_l, T_v]
+            C_TV = C_TV * (m_l.unsqueeze(2) * m_v.unsqueeze(1))
+            # [B, T_a, T_v]
+            C_AV = C_AV * (m_a.unsqueeze(2) * m_v.unsqueeze(1))
             C_VA = C_AV.transpose(1, 2)
 
             R_TV_1 = C_TV.unsqueeze(2) 
@@ -294,7 +314,9 @@ class MULTModel(nn.Module):
                          correlation_bias=C_cube_stream2, 
                          lambda_param=self.lambda_param)
 
-        last_hs = torch.cat([h_s1[-1], h_s2[-1]], dim=1)
+        hs1_pool = masked_mean_pool(h_s1, mask_l)
+        hs2_pool = masked_mean_pool(h_s2, mask_l)
+        last_hs = torch.cat([hs1_pool, hs2_pool], dim=1)   # [B, 2D]
         
         last_hs_proj = self.proj2(F.dropout(F.relu(self.proj1(last_hs)), p=self.out_dropout, training=self.training))
         last_hs_proj += last_hs
@@ -302,3 +324,9 @@ class MULTModel(nn.Module):
         output = self.out_layer(last_hs_proj)
         
         return output, last_hs
+def masked_mean_pool(seq_TBD, mask_BT):
+    # seq_TBD: [T, B, D] -> [B, T, D]
+    seq = seq_TBD.transpose(0, 1)
+    mask = mask_BT.unsqueeze(-1).type_as(seq)   # [B, T, 1]
+    denom = mask.sum(dim=1).clamp_min(1.0)      # [B, 1]
+    return (seq * mask).sum(dim=1) / denom      # [B, D]

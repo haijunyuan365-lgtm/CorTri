@@ -19,7 +19,11 @@ def initiate(hyp_params, train_loader, valid_loader, test_loader):
     if hyp_params.use_cuda:
         model = model.cuda()
 
-    optimizer = getattr(optim, hyp_params.optim)(model.parameters(), lr=hyp_params.lr)
+    optimizer = getattr(optim, hyp_params.optim)(
+    model.parameters(), 
+    lr=hyp_params.lr, 
+    weight_decay=hyp_params.weight_decay
+    )
     criterion = getattr(nn, hyp_params.criterion)()
     
     # 初始化对比损失函数 (Stage 2 不需要，但为了代码兼容性保留初始化，不调用即可)
