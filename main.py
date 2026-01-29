@@ -46,7 +46,7 @@ parser.add_argument('--batch_size', type=int, default=32, metavar='N', help='bat
 parser.add_argument('--clip', type=float, default=0.8, help='gradient clip value (default: 0.8)')
 parser.add_argument('--lr', type=float, default=1e-4, help='initial learning rate (default: 3 * 1e-4)')
 parser.add_argument('--optim', type=str, default='Adam',help='optimizer to use (default: Adam)')
-parser.add_argument('--num_epochs', type=int, default=10, help='number of epochs (default: 40)')
+parser.add_argument('--num_epochs', type=int, default=20, help='number of epochs (default: 40)')
 parser.add_argument('--when', type=int, default=10, help='when to decay learning rate (default: 20)')
 parser.add_argument('--batch_chunk', type=int, default=1, help='number of chunks per batch (default: 1)')
 
@@ -236,7 +236,7 @@ elif hyp_params.dataset == "ch_sims":
 if args.aligned:
     predefined_max_len = 100
 else:
-    predefined_max_len = 400  # 给 Unaligned 足够空间
+    predefined_max_len = 300  # 给 Unaligned 足够空间
 hyp_params.l_len = min(hyp_params.l_len, predefined_max_len)
 hyp_params.a_len = min(hyp_params.a_len, predefined_max_len)
 hyp_params.v_len = min(hyp_params.v_len, predefined_max_len)

@@ -5,7 +5,7 @@ import math
 import os
 from modules.transformer import TransformerEncoder
 from modality_correlation.correlation_models import CorrelationModel
-
+from modules.position_embedding import SinusoidalPositionalEmbedding
 # ==============================================================================
 # Part 1: 支持 Mask 的 TriSAT 核心组件
 # ==============================================================================
@@ -203,7 +203,8 @@ class MULTModel(nn.Module):
         self.proj_l = nn.Conv1d(self.orig_d_l, self.d_model, kernel_size=1, padding=0, bias=False)
         self.proj_a = nn.Conv1d(self.orig_d_a, self.d_model, kernel_size=1, padding=0, bias=False)
         self.proj_v = nn.Conv1d(self.orig_d_v, self.d_model, kernel_size=1, padding=0, bias=False)
-
+        self.embed_positions = SinusoidalPositionalEmbedding(self.d_model)
+        
         if self.use_correlation:
             corr_config = dataset_specific_configs[hyp_params.dataset].copy()
             corr_config['text_in_dim'] = hyp_params.orig_d_l
@@ -294,6 +295,18 @@ class MULTModel(nn.Module):
         proj_a = self.proj_a(x_a_p).permute(2, 0, 1)
         proj_v = self.proj_v(x_v_p).permute(2, 0, 1)
 
+        # ======================================================
+        # [新增] 应用位置编码 (CorMulT 的样式)
+        # =====================================================
+        if self.embed_positions is not None:
+            # proj_l 是 [T, B, D]
+            # transpose(0, 1) 变成 [B, T, D]
+            # [:, :, 0] 变成 [B, T]，作为 generating positions 的依据
+            proj_l = proj_l + self.embed_positions(proj_l.transpose(0, 1)[:, :, 0]).transpose(0, 1)
+            proj_a = proj_a + self.embed_positions(proj_a.transpose(0, 1)[:, :, 0]).transpose(0, 1)
+            proj_v = proj_v + self.embed_positions(proj_v.transpose(0, 1)[:, :, 0]).transpose(0, 1)
+        # ======================================================
+        
         # Stream 1: Key=Audio, Value=Video
         # 传入 key_mask=Audio, value_mask=Video
         h_s1 = proj_l
