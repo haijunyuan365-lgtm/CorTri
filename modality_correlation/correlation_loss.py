@@ -8,44 +8,50 @@ class TripleLoss(nn.Module):
         super(TripleLoss, self).__init__()
         self.margin = margin
 
-    def forward(self, F_anchor, F_pos, F_neg):
+    def forward(self, F_anchor, F_pos, F_neg, mask_anchor=None, mask_pos=None, mask_neg=None):
         """
-        F_anchor: [B, T1, D] (例如 Text)
-        F_pos:    [B, T2, D] (例如 Audio Positive)
-        F_neg:    [B, T3, D] (例如 Audio Negative)
-        
-        Modification for Idea:
-        不再使用 .mean(dim=1) 进行全局池化。
-        而是计算细粒度相关性矩阵，并基于矩阵的最大匹配度(Max-Alignment)计算距离。
-        这迫使模型学习 Token/Frame 级别的细粒度相关性，而非全局统计量的相关性。
+        F_anchor: [B, T1, D]
+        F_pos:    [B, T2, D]
+        F_neg:    [B, T3, D]
+        mask_*:   [B, T*]  True=valid
         """
-        
-        # 1. 归一化特征 (为了计算 Cosine Similarity 矩阵)
-        # norm: [B, T, D]
-        anchor_norm = F.normalize(F_anchor, p=2, dim=-1)
-        pos_norm = F.normalize(F_pos, p=2, dim=-1)
-        neg_norm = F.normalize(F_neg, p=2, dim=-1)
 
-        # 2. 计算细粒度相关性矩阵 [B, T_anchor, T_other]
-        # matrix[b, i, j] 代表 anchor 第 i 个时刻与 pos/neg 第 j 个时刻的相似度
-        sim_matrix_pos = torch.bmm(anchor_norm, pos_norm.transpose(1, 2))
-        sim_matrix_neg = torch.bmm(anchor_norm, neg_norm.transpose(1, 2))
+        # normalize
+        F_anchor = F.normalize(F_anchor, p=2, dim=-1, eps=1e-8)
+        F_pos    = F.normalize(F_pos,    p=2, dim=-1, eps=1e-8)
+        F_neg    = F.normalize(F_neg,    p=2, dim=-1, eps=1e-8)
 
-        # 3. 计算相似度分数 (Similarity Score)
-        # 策略: Max-over-time Pooling (Chamfer-like score)
-        # 对于 Anchor 中的每一个时间步，找到 Pos/Neg 中最相似的时间步作为匹配分，然后平均。
-        # 这样既保留了细粒度信息，又允许局部错位 (Local Misalignment)。
-        
-        # values shape: [B, T_anchor] -> mean -> [B]
-        score_pos = sim_matrix_pos.max(dim=-1).values.mean(dim=-1)
-        score_neg = sim_matrix_neg.max(dim=-1).values.mean(dim=-1)
+        # Corr matrices
+        Corr_pos = torch.bmm(F_anchor, F_pos.transpose(1, 2))  # [B,T1,T2]
+        Corr_neg = torch.bmm(F_anchor, F_neg.transpose(1, 2))  # [B,T1,T3]
 
-        # 4. 计算距离与 Loss
-        # Cosine Similarity 越大，距离越小
-        dist_pos = 1.0 - score_pos
-        dist_neg = 1.0 - score_neg
+        def masked_max_mean(Corr, m1, m2):
+            # m1: [B,T1], m2:[B,T2]
+            if (m1 is None) or (m2 is None):
+                max_corr = Corr.max(dim=2)[0].max(dim=1)[0]      # [B]
+                mean_corr = Corr.mean(dim=(1,2))                 # [B]
+                return max_corr, mean_corr
 
-        # Triplet Loss: max(0, dist_pos - dist_neg + margin)
-        loss = torch.clamp(dist_pos - dist_neg + self.margin, min=0.0)
-        
-        return loss.mean()
+            pair_mask = (m1.unsqueeze(2) & m2.unsqueeze(1))      # [B,T1,T2]
+
+            # max：无效位置设 -inf
+            Corr_for_max = Corr.masked_fill(~pair_mask, -1e9)
+            max_corr = Corr_for_max.max(dim=2)[0].max(dim=1)[0]  # [B]
+
+            # mean：只对有效位置平均
+            Corr_for_sum = Corr.masked_fill(~pair_mask, 0.0)
+            denom = pair_mask.sum(dim=(1,2)).float().clamp_min(1.0)  # [B]
+            mean_corr = Corr_for_sum.sum(dim=(1,2)) / denom          # [B]
+            return max_corr, mean_corr
+
+        max_pos, mean_pos = masked_max_mean(Corr_pos, mask_anchor, mask_pos)
+        max_neg, mean_neg = masked_max_mean(Corr_neg, mask_anchor, mask_neg)
+
+        corr_pos = 0.5 * (max_pos + mean_pos)
+        corr_neg = 0.5 * (max_neg + mean_neg)
+
+        dist_pos = 1.0 - corr_pos
+        dist_neg = 1.0 - corr_neg
+
+        loss = F.relu(dist_pos - dist_neg + self.margin).mean()
+        return loss

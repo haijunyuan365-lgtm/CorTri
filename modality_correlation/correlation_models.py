@@ -76,28 +76,48 @@ class CorrelationModel(nn.Module):
         self.vision_out_fc = nn.Linear(d_model, out_dim)
 
     def forward(self, text, audio, vision):
-        # text: [B, T_l, 300]
-        # audio: [B, T_a, 74]
-        # vision: [B, T_v, 35]
+    """
+    text:   [B, T_l, text_in_dim]
+    audio:  [B, T_a, audio_in_dim]
+    vision: [B, T_v, vision_in_dim]
+    return:
+        t_out: [B, T_l, out_dim]
+        a_out: [B, T_a, out_dim]
+        v_out: [B, T_v, out_dim]
+    """
 
-        # Linear mapping to d_model dimension
-        t_emb = self.text_fc(text)    # [B, T_l, d_model]
-        a_emb = self.audio_fc(audio)  # [B, T_a, d_model]
-        v_emb = self.vision_fc(vision)# [B, T_v, d_model]
+    # 1) padding mask：True=valid
+    text_valid = (text.abs().sum(dim=-1) > 0)    # [B, T_l]
+    audio_valid = (audio.abs().sum(dim=-1) > 0)  # [B, T_a]
+    vision_valid = (vision.abs().sum(dim=-1) > 0)# [B, T_v]
 
-        # Add positional encoding
-        t_emb = self.pos_encoder(t_emb)
-        a_emb = self.pos_encoder(a_emb)
-        v_emb = self.pos_encoder(v_emb)
+    # Transformer 的 src_key_padding_mask：True=PAD，需要取反
+    text_pad = ~text_valid
+    audio_pad = ~audio_valid
+    vision_pad = ~vision_valid
 
-        # Pass through TransformerEncoders
-        t_enc = self.text_encoder(t_emb)   # [B, T_l, d_model]
-        a_enc = self.audio_encoder(a_emb)  # [B, T_a, d_model]
-        v_enc = self.vision_encoder(v_emb) # [B, T_v, d_model]
+    # Linear mapping to d_model dimension
+    t_emb = self.text_fc(text)    # [B, T_l, d_model]
+    a_emb = self.audio_fc(audio)  # [B, T_a, d_model]
+    v_emb = self.vision_fc(vision)# [B, T_v, d_model]
 
-        # Map to shared space
-        t_out = self.text_out_fc(t_enc)    # [B, T_l, out_dim]
-        a_out = self.audio_out_fc(a_enc)   # [B, T_a, out_dim]
-        v_out = self.vision_out_fc(v_enc)  # [B, T_v, out_dim]
+    t_emb = self.pos_encoder(t_emb)
+    a_emb = self.pos_encoder(a_emb)
+    v_emb = self.pos_encoder(v_emb)
 
-        return t_out, a_out, v_out
+    # 3) encoder（关键：传 mask）
+    t_encoded = self.text_encoder(t_emb, src_key_padding_mask=text_pad)
+    a_encoded = self.audio_encoder(a_emb, src_key_padding_mask=audio_pad)
+    v_encoded = self.vision_encoder(v_emb, src_key_padding_mask=vision_pad)
+
+    # 4) 输出层
+    t_out = self.out_fc(t_encoded)
+    a_out = self.out_fc(a_encoded)
+    v_out = self.out_fc(v_encoded)
+
+    # 5) （强烈建议）把 PAD 位置清零，避免后续 loss/bmm 被污染
+    t_out = t_out * text_valid.unsqueeze(-1).type_as(t_out)
+    a_out = a_out * audio_valid.unsqueeze(-1).type_as(a_out)
+    v_out = v_out * vision_valid.unsqueeze(-1).type_as(v_out)
+
+    return t_out, a_out, v_out
