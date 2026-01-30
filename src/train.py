@@ -214,6 +214,14 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
                 
         return epoch_loss / hyp_params.n_train
 
+    def log_bias_params(model):
+        if not hasattr(model, "lambda_param"):
+            return
+        lam = torch.sigmoid(model.lambda_param.detach()).item()
+        w1 = torch.softmax(torch.stack([model.w_tv, model.w_ta, model.w_va]), dim=0).detach().cpu().numpy()
+        w2 = torch.softmax(torch.stack([model.w_tv, model.w_ta, model.w_av]), dim=0).detach().cpu().numpy()
+        print(f"[DBG] lambda(sigmoid)={lam:.4f}  w_s1(tv,ta,va)={w1}  w_s2(tv,ta,av)={w2}")
+        
     def evaluate(model, criterion, test=False):
         model.eval()
         loader = test_loader if test else valid_loader
@@ -279,8 +287,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
     # === 打印漂亮的表头 ===
     print("\n" + "="*95)
     print(f"{'Epoch':^6} | {'Set':^5} | {'Loss':^8} | {'MAE':^8} | {'Acc-7':^8} | {'Acc-2':^8} | {'F1':^8} | {'Time':^8}")
-    print("="*95)
-
+    print("="*95)  
     for epoch in range(1, hyp_params.num_epochs+1):
         start = time.time()
         
@@ -303,6 +310,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         print("-" * 95)
         print(f"{epoch:^6} | {'Valid':^5} | {val_loss:.4f}   | {v_mae:.4f}   | {v_acc7:.4f}   | {v_acc2:.4f}   | {v_f1:.4f}   | {duration:.2f}s")
         print(f"{'':^6} | {'Test':^5}  | {test_loss:.4f}   | {t_mae:.4f}   | {t_acc7:.4f}   | {t_acc2:.4f}   | {t_f1:.4f}   |")
+        log_bias_params(model)
         print("-" * 95)
         
         # === 使用 F1 Score 保存最佳模型 ===
