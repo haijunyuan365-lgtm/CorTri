@@ -38,18 +38,6 @@ class CorrelationModel(nn.Module):
                  dim_feedforward=256,
                  dropout=0.1,
                  out_dim=64):
-        """
-        Parameter description:
-        text_in_dim: The dimension of text input features (default 300)
-        audio_in_dim: The dimension of audio input features (default 74)
-        vision_in_dim: The dimension of vision input features (default 35)
-        d_model: Transformer hidden layer dimension
-        num_layers: Number of Transformer layers
-        num_heads: Number of heads in MultiheadAttention
-        dim_feedforward: The dimension of the intermediate layer in the FFN
-        dropout: The dropout rate
-        out_dim: The dimension of the mapped shared space
-        """
         super(CorrelationModel, self).__init__()
         
         # Map to a unified d_model dimension
@@ -80,41 +68,50 @@ class CorrelationModel(nn.Module):
         text:   [B, T_l, text_in_dim]
         audio:  [B, T_a, audio_in_dim]
         vision: [B, T_v, vision_in_dim]
-        return:
-            t_out: [B, T_l, out_dim]
-            a_out: [B, T_a, out_dim]
-            v_out: [B, T_v, out_dim]
         """
-        # 1) padding mask：True=valid
+        # 1) 计算 Padding Mask：True = 有效 (Valid)
         text_valid = (text.abs().sum(dim=-1) > 0)    # [B, T_l]
         audio_valid = (audio.abs().sum(dim=-1) > 0)  # [B, T_a]
         vision_valid = (vision.abs().sum(dim=-1) > 0)# [B, T_v]
 
-        # Transformer 的 src_key_padding_mask：True=PAD，需要取反
+        # 2) Transformer 需要的 Mask：True = Padding (被忽略)
         text_pad = ~text_valid
         audio_pad = ~audio_valid
         vision_pad = ~vision_valid
 
-        # Linear mapping to d_model dimension
-        t_emb = self.text_fc(text)    # [B, T_l, d_model]
-        a_emb = self.audio_fc(audio)  # [B, T_a, d_model]
-        v_emb = self.vision_fc(vision)# [B, T_v, d_model]
+        # === 【关键修复】防止全 Padding 导致 Transformer 输出 NaN ===
+        # 如果某一样本的整个序列都是 Padding (全 True)，Transformer 会输出 NaN。
+        # 强制把第一个位置设为 False (有效)，让它跑通计算。
+        # 虽然算出来的是 garbage，但在步骤 5 我们会把它 mask 成 0，所以不影响 Loss。
+        if text_pad.all(dim=1).any():
+            text_pad[text_pad.all(dim=1), 0] = False
+        if audio_pad.all(dim=1).any():
+            audio_pad[audio_pad.all(dim=1), 0] = False
+        if vision_pad.all(dim=1).any():
+            vision_pad[vision_pad.all(dim=1), 0] = False
+        # ==========================================================
+
+        # Linear mapping
+        t_emb = self.text_fc(text)
+        a_emb = self.audio_fc(audio)
+        v_emb = self.vision_fc(vision)
 
         t_emb = self.pos_encoder(t_emb)
         a_emb = self.pos_encoder(a_emb)
         v_emb = self.pos_encoder(v_emb)
 
-        # 3) encoder（关键：传 mask）
+        # 3) Encoder
         t_encoded = self.text_encoder(t_emb, src_key_padding_mask=text_pad)
         a_encoded = self.audio_encoder(a_emb, src_key_padding_mask=audio_pad)
         v_encoded = self.vision_encoder(v_emb, src_key_padding_mask=vision_pad)
 
-        # 4) 输出层
-        t_out = self.out_fc(t_encoded)
-        a_out = self.out_fc(a_encoded)
-        v_out = self.out_fc(v_encoded)
+        # 4) 输出层 (修复了变量名错误)
+        t_out = self.text_out_fc(t_encoded)
+        a_out = self.audio_out_fc(a_encoded)
+        v_out = self.vision_out_fc(v_encoded)
 
-        # 5) （强烈建议）把 PAD 位置清零，避免后续 loss/bmm 被污染
+        # 5) 再次 Mask 输出：将 Padding 位置强制置 0
+        # 这步至关重要，它消除了步骤 2 中产生的 garbage 值和潜在的 NaN
         t_out = t_out * text_valid.unsqueeze(-1).type_as(t_out)
         a_out = a_out * audio_valid.unsqueeze(-1).type_as(a_out)
         v_out = v_out * vision_valid.unsqueeze(-1).type_as(v_out)

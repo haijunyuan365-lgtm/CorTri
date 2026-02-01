@@ -15,13 +15,12 @@ class TripleLoss(nn.Module):
         F_neg:    [B, T3, D]
         mask_*:   [B, T*]  True=valid
         """
-
         # normalize
         F_anchor = F.normalize(F_anchor, p=2, dim=-1, eps=1e-8)
         F_pos    = F.normalize(F_pos,    p=2, dim=-1, eps=1e-8)
         F_neg    = F.normalize(F_neg,    p=2, dim=-1, eps=1e-8)
 
-        # Corr matrices
+        # Corr matrices (Cosine Similarity: range [-1, 1])
         Corr_pos = torch.bmm(F_anchor, F_pos.transpose(1, 2))  # [B,T1,T2]
         Corr_neg = torch.bmm(F_anchor, F_neg.transpose(1, 2))  # [B,T1,T3]
 
@@ -34,14 +33,19 @@ class TripleLoss(nn.Module):
 
             pair_mask = (m1.unsqueeze(2) & m2.unsqueeze(1))      # [B,T1,T2]
 
-            # max：无效位置设 -inf
-            Corr_for_max = Corr.masked_fill(~pair_mask, -1e9)
+            # === 【关键修复】 ===
+            # 不要用 -1e9，因为如果是全空样本，max 就会变成 -1e9，导致 Loss 爆炸。
+            # Cosine Similarity 最小是 -1，所以填 -2.0 足够小，且不会破坏数值范围。
+            Corr_for_max = Corr.masked_fill(~pair_mask, -2.0)
+            
+            # 如果某行全为 -2.0 (全无效)，max 取出来就是 -2.0，计算出的 loss 会很小且可控
             max_corr = Corr_for_max.max(dim=2)[0].max(dim=1)[0]  # [B]
 
             # mean：只对有效位置平均
             Corr_for_sum = Corr.masked_fill(~pair_mask, 0.0)
             denom = pair_mask.sum(dim=(1,2)).float().clamp_min(1.0)  # [B]
             mean_corr = Corr_for_sum.sum(dim=(1,2)) / denom          # [B]
+            
             return max_corr, mean_corr
 
         max_pos, mean_pos = masked_max_mean(Corr_pos, mask_anchor, mask_pos)
@@ -53,5 +57,6 @@ class TripleLoss(nn.Module):
         dist_pos = 1.0 - corr_pos
         dist_neg = 1.0 - corr_neg
 
+        # 计算 Loss 并求平均
         loss = F.relu(dist_pos - dist_neg + self.margin).mean()
         return loss
