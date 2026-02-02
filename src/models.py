@@ -328,7 +328,7 @@ class MULTModel(nn.Module):
         self.w_ta = nn.Parameter(torch.tensor(0.33))
         self.w_va = nn.Parameter(torch.tensor(0.33))
         self.w_av = nn.Parameter(torch.tensor(0.33))
-        self.lambda_param = nn.Parameter(torch.tensor(1.0))
+        self.lambda_param = nn.Parameter(torch.tensor(2.0))
 
         combined_dim = 2 * self.d_model
         self.proj1 = nn.Linear(combined_dim, combined_dim)
