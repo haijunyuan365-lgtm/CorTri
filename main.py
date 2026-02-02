@@ -59,7 +59,7 @@ parser.add_argument('--name', type=str, default='mult', help='name of the trial 
 # Disturbance control:
 parser.add_argument('--perturbation_ratio', type=float, default=0.0, help='Proportion of perturbed samples used in the training set')
 parser.add_argument('--sample_ratio', type=float, default=1.0, help='Proportion of data retained in the training set')
-parser.add_argument('--max_samples', type=int, default=4000, help='Maximum number of samples to use')
+parser.add_argument('--max_samples', type=int, default=non, help='Maximum number of samples to use')
 # 在 Tuning 部分添加
 parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay (default: 1e-4)')
 # ======================================================
