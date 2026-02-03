@@ -71,7 +71,7 @@ parser.add_argument('--corr_model_path', type=str, default='',
                     help='Optional: path to pretrained correlation model (state_dict). Empty => train from scratch.')
 parser.add_argument('--freeze_corr_model', action='store_true',
                     help='Freeze correlation model parameters (no gradient updates).')
-parser.add_argument('--corr_bias_grad', action=argparse.BooleanOptionalAction, default=False,
+parser.add_argument('--corr_bias_grad', action=argparse.BooleanOptionalAction, default=True,
                     help='Allow task-loss gradient to flow into corr_model through correlation bias (higher memory).')
 # 在 main.py 的 argparse 部分加入这行
 parser.add_argument('--use_correlation', action=argparse.BooleanOptionalAction, default=True,
@@ -147,7 +147,7 @@ valid_data = UnifiedMultimodalDataset(
     split_type='valid',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=False, # 关键修改
+    for_correlation=True, # 关键修改
     perturbation_ratio=0,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
@@ -162,7 +162,7 @@ test_data = UnifiedMultimodalDataset(
     split_type='test',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=False, # 关键修改
+    for_correlation=True, # 关键修改
     perturbation_ratio=0,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
