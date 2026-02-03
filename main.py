@@ -44,9 +44,9 @@ parser.add_argument('--attn_mask', action='store_false', help='use attention mas
 # Tuning
 parser.add_argument('--batch_size', type=int, default=32, metavar='N', help='batch size (default: 24)')
 parser.add_argument('--clip', type=float, default=0.8, help='gradient clip value (default: 0.8)')
-parser.add_argument('--lr', type=float, default=1e-4, help='initial learning rate (default: 3 * 1e-4)')
+parser.add_argument('--lr', type=float, default=2e-4, help='initial learning rate (default: 3 * 1e-4)')
 parser.add_argument('--optim', type=str, default='Adam',help='optimizer to use (default: Adam)')
-parser.add_argument('--num_epochs', type=int, default=12, help='number of epochs (default: 40)')
+parser.add_argument('--num_epochs', type=int, default=10, help='number of epochs (default: 40)')
 parser.add_argument('--when', type=int, default=10, help='when to decay learning rate (default: 20)')
 parser.add_argument('--batch_chunk', type=int, default=1, help='number of chunks per batch (default: 1)')
 
@@ -59,7 +59,7 @@ parser.add_argument('--name', type=str, default='mult', help='name of the trial 
 # Disturbance control:
 parser.add_argument('--perturbation_ratio', type=float, default=0.0, help='Proportion of perturbed samples used in the training set')
 parser.add_argument('--sample_ratio', type=float, default=1.0, help='Proportion of data retained in the training set')
-parser.add_argument('--max_samples', type=int, default=non, help='Maximum number of samples to use')
+parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples to use')
 # 在 Tuning 部分添加
 parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay (default: 1e-4)')
 # ======================================================
