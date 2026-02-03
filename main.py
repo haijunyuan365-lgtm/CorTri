@@ -42,11 +42,11 @@ parser.add_argument('--num_heads', type=int, default=2, help='number of heads fo
 parser.add_argument('--attn_mask', action='store_false', help='use attention mask for Transformer (default: true)')
 
 # Tuning
-parser.add_argument('--batch_size', type=int, default=48, metavar='N', help='batch size (default: 24)')
+parser.add_argument('--batch_size', type=int, default=32, metavar='N', help='batch size (default: 24)')
 parser.add_argument('--clip', type=float, default=0.8, help='gradient clip value (default: 0.8)')
-parser.add_argument('--lr', type=float, default=3 * 1e-4, help='initial learning rate (default: 3 * 1e-4)')
-parser.add_argument('--optim', type=str, default='Adam', help='optimizer to use (default: Adam)')
-parser.add_argument('--num_epochs', type=int, default=20, help='number of epochs (default: 40)')
+parser.add_argument('--lr', type=float, default=2e-4, help='initial learning rate (default: 3 * 1e-4)')
+parser.add_argument('--optim', type=str, default='Adam',help='optimizer to use (default: Adam)')
+parser.add_argument('--num_epochs', type=int, default=10, help='number of epochs (default: 40)')
 parser.add_argument('--when', type=int, default=10, help='when to decay learning rate (default: 20)')
 parser.add_argument('--batch_chunk', type=int, default=1, help='number of chunks per batch (default: 1)')
 
@@ -60,15 +60,22 @@ parser.add_argument('--name', type=str, default='mult', help='name of the trial 
 parser.add_argument('--perturbation_ratio', type=float, default=0.0, help='Proportion of perturbed samples used in the training set')
 parser.add_argument('--sample_ratio', type=float, default=1.0, help='Proportion of data retained in the training set')
 parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples to use')
-
+# 在 Tuning 部分添加
+parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay (default: 1e-4)')
 # ======================================================
 # 新增: 端到端训练需要的超参数
 # ======================================================
 parser.add_argument('--beta', type=float, default=0.1, help='Weight for contrastive loss in total loss')
 parser.add_argument('--margin', type=float, default=0.2, help='Margin for TripleLoss')
+parser.add_argument('--corr_model_path', type=str, default='',
+                    help='Optional: path to pretrained correlation model (state_dict). Empty => train from scratch.')
+parser.add_argument('--freeze_corr_model', action='store_true',
+                    help='Freeze correlation model parameters (no gradient updates).')
+parser.add_argument('--corr_bias_grad', action=argparse.BooleanOptionalAction, default=False,
+                    help='Allow task-loss gradient to flow into corr_model through correlation bias (higher memory).')
 # 在 main.py 的 argparse 部分加入这行
-parser.add_argument('--use_correlation', default=False, action='store_true', help='Use correlation model and loss (End-to-End training)')
-
+parser.add_argument('--use_correlation', action=argparse.BooleanOptionalAction, default=True,
+                    help='Enable correlation module & (optionally) contrastive loss. Use --no-use_correlation to disable.')
 args = parser.parse_args()
 # args.data_path = "/root/CH-SIMS"
 # args.dataset = "ch_sims"
@@ -113,8 +120,12 @@ print("before loading the data")
 print(gpustat.print_gpustat())
 print("Start loading the data....")
 
+# If beta>0, we need negative samples for contrastive loss during training.
+train_for_correlation = bool(args.use_correlation) and float(args.beta) > 0.0
+
+
 # ======================================================
-# 修改 1: 开启 for_correlation=True 以生成负样本
+# 单阶段(E2E)训练：train split 可选返回负样本，用于对比/三元组损失 
 # ======================================================
 train_data = UnifiedMultimodalDataset(
     dataset_path=args.data_path,
@@ -122,8 +133,8 @@ train_data = UnifiedMultimodalDataset(
     split_type='train',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=True,  # 关键修改：开启负样本生成
-    perturbation_ratio=0.3,
+    for_correlation=train_for_correlation, 
+    perturbation_ratio=0,
     noise_std=0.05
 )
 
@@ -136,8 +147,8 @@ valid_data = UnifiedMultimodalDataset(
     split_type='valid',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=True, # 关键修改
-    perturbation_ratio=0.3,
+    for_correlation=False, # 关键修改
+    perturbation_ratio=0,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
 )
@@ -151,7 +162,7 @@ test_data = UnifiedMultimodalDataset(
     split_type='test',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=True, # 关键修改
+    for_correlation=False, # 关键修改
     perturbation_ratio=0,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
@@ -160,53 +171,71 @@ test_data = UnifiedMultimodalDataset(
 print("test data loaded")
 print(gpustat.print_gpustat())
 
-# ======================================================
-# 修改 2: 更新 Collate Function 以处理负样本
-# ======================================================
-def get_collate_fn(hyp_params):
+# main.py 修改建议
+
+def get_collate_fn(hyp_params, include_neg: bool = False):
     def collate_fn(batch):
         """
-        处理 for_correlation=True 时的 batch 数据结构:
-        batch item: ((meta, text, audio, vision), (text_neg, audio_neg, vision_neg), label, META_ORIG)
+        Collate function (supports both modes):
+        - include_neg=False (Stage2/纯任务): returns (metas, text, audio, vision, label)
+        - include_neg=True  (E2E/单阶段):  returns (metas, text, audio, vision, text_neg, audio_neg, vision_neg, label)
         """
         max_text_len = hyp_params.l_len
         max_audio_len = hyp_params.a_len
         max_vision_len = hyp_params.v_len
 
-        # 提取数据
-        metas = [item[0][0] for item in batch]
-        
-        # 正样本截断
-        texts = [item[0][1][:max_text_len] for item in batch]
-        audios = [item[0][2][:max_audio_len] for item in batch]
-        visions = [item[0][3][:max_vision_len] for item in batch]
-        
-        # 负样本截断
-        texts_neg = [item[1][0][:max_text_len] for item in batch]
-        audios_neg = [item[1][1][:max_audio_len] for item in batch]
-        visions_neg = [item[1][2][:max_vision_len] for item in batch]
-        
-        labels = [item[2] for item in batch]
+        metas = []
+        labels = []
 
-        # Padding (正样本)
+        texts = []
+        audios = []
+        visions = []
+
+        texts_neg = []
+        audios_neg = []
+        visions_neg = []
+
+        for item in batch:
+            # Regular mode: ((meta, text, audio, vision), label, (meta,))
+            # Correlation mode: ((meta, text_pos, audio_pos, vision_pos), (text_neg, audio_neg, vision_neg), label, META)
+            if include_neg:
+                (meta, t_pos, a_pos, v_pos), (t_neg, a_neg, v_neg), label, _META = item
+                metas.append(meta)
+                labels.append(label)
+
+                texts.append(t_pos[:max_text_len])
+                audios.append(a_pos[:max_audio_len])
+                visions.append(v_pos[:max_vision_len])
+
+                texts_neg.append(t_neg[:max_text_len])
+                audios_neg.append(a_neg[:max_audio_len])
+                visions_neg.append(v_neg[:max_vision_len])
+            else:
+                (meta, t, a, v), label, _ = item
+                metas.append(meta)
+                labels.append(label)
+
+                texts.append(t[:max_text_len])
+                audios.append(a[:max_audio_len])
+                visions.append(v[:max_vision_len])
+
         texts_padded = pad_sequence(texts, batch_first=True)
         audios_padded = pad_sequence(audios, batch_first=True)
         visions_padded = pad_sequence(visions, batch_first=True)
-        
-        # Padding (负样本)
+        labels_tensor = torch.stack(labels).view(-1)
+
+        if not include_neg:
+            return (metas, texts_padded, audios_padded, visions_padded, labels_tensor)
+
         texts_neg_padded = pad_sequence(texts_neg, batch_first=True)
         audios_neg_padded = pad_sequence(audios_neg, batch_first=True)
         visions_neg_padded = pad_sequence(visions_neg, batch_first=True)
 
-        # Labels
-        labels_tensor = torch.stack(labels).squeeze(-1) 
-
-        # 返回符合 src/train.py 期望的 Flat Tuple (8个元素)
-        return (metas, 
-                texts_padded, audios_padded, visions_padded, 
-                texts_neg_padded, audios_neg_padded, visions_neg_padded, 
+        return (metas,
+                texts_padded, audios_padded, visions_padded,
+                texts_neg_padded, audios_neg_padded, visions_neg_padded,
                 labels_tensor)
-                
+
     return collate_fn
 
 print('Finish loading the data....')
@@ -232,18 +261,18 @@ hyp_params.model = str.upper(args.model.strip())
 hyp_params.output_dim = output_dim_dict.get(dataset, 1)
 hyp_params.criterion = criterion_dict.get(dataset, 'L1Loss')
 hyp_params.criterion = 'MSELoss'
+# hyp_params.criterion = 'L1Loss'
 
-# 预训练模型路径 (End-to-End 模式下作为初始化权重)
-if hyp_params.dataset == "mosei_senti":
-    hyp_params.corr_model_path = "/root/CorMulT/Correlation-Aware-Multimodal-Transformer/pre_trained_models/correlation_model012409.pt"
-elif hyp_params.dataset == "ch_sims":
-    hyp_params.corr_model_path = "/root/CorMulT/Correlation-Aware-Multimodal-Transformer/pre_trained_models/correlation_model_ch_sims.pt"
+
+# correlation model init (optional pretrained)
+if hasattr(args, 'corr_model_path') and args.corr_model_path:
+    hyp_params.corr_model_path = args.corr_model_path
 
 # newly added
 if args.aligned:
     predefined_max_len = 100
 else:
-    predefined_max_len = 400  # 给 Unaligned 足够空间
+    predefined_max_len = 300  # 给 Unaligned 足够空间
 hyp_params.l_len = min(hyp_params.l_len, predefined_max_len)
 hyp_params.a_len = min(hyp_params.a_len, predefined_max_len)
 hyp_params.v_len = min(hyp_params.v_len, predefined_max_len)
@@ -256,15 +285,18 @@ hyp_params.name = ("DyCoTri" if hyp_params.use_correlation else "MulT") + "_" + 
 # ======================================================
 print("before train_loader")
 print(gpustat.print_gpustat())
-train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, collate_fn=get_collate_fn(hyp_params))
+train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
+                          collate_fn=get_collate_fn(hyp_params, include_neg=train_for_correlation))
 
 print("before valid_loader")
 print(gpustat.print_gpustat())
-valid_loader = DataLoader(valid_data, batch_size=args.batch_size, shuffle=True, collate_fn=get_collate_fn(hyp_params))
+valid_loader = DataLoader(valid_data, batch_size=args.batch_size, shuffle=False,
+                          collate_fn=get_collate_fn(hyp_params, include_neg=False))
 
 print("before test_loader")
 print(gpustat.print_gpustat())
-test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=True, collate_fn=get_collate_fn(hyp_params))
+test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False,
+                          collate_fn=get_collate_fn(hyp_params, include_neg=False))
 
 
 if __name__ == '__main__':
