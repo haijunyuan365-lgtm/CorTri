@@ -80,7 +80,13 @@ class TrimodalMultiheadAttention(nn.Module):
             k = F.normalize(k, p=2, dim=-1, eps=1e-8)
             v = F.normalize(v, p=2, dim=-1, eps=1e-8)
 
-        # 1) 4D tri-attn logits: [B*H, Tq, Tk, Tv]
+                # 1) 4D tri-attn logits: [B*H, Tq, Tk, Tv]
+        #    端到端训练更容易在 tri-linear einsum 溢出，因此这里强制用 fp32 计算，再在输出处 cast 回原 dtype。
+        orig_dtype = query.dtype
+        q = q.float()
+        k = k.float()
+        v = v.float()
+
         attn_weights = torch.einsum('iat,ibt,ict->iabc', q, k, v)
 
         # 2) 构造 key mask expand: [B*H, Tq, Tk, Tv]
@@ -121,9 +127,10 @@ class TrimodalMultiheadAttention(nn.Module):
         else:
             avg_score = attn_weights.mean(dim=-2, keepdim=True)
 
-        # --- Max 分支：padding=-inf ---
+        # --- Max 分支：padding=finite min（避免 AMP/fp16 下 -1e9 -> -inf 导致 softmax NaN） ---
+        neg_large_4d = torch.finfo(attn_weights.dtype).min
         if mask_k_expanded is not None:
-            attn_for_max = attn_weights.masked_fill(~mask_k_expanded, -1e9)
+            attn_for_max = attn_weights.masked_fill(~mask_k_expanded, neg_large_4d)
         else:
             attn_for_max = attn_weights
 
@@ -151,7 +158,7 @@ class TrimodalMultiheadAttention(nn.Module):
                 )
                 bias_avg = bias_sum / scale2
 
-                bias_for_max = bias_expanded.masked_fill(~mask_k_expanded, -1e9)
+                bias_for_max = bias_expanded.masked_fill(~mask_k_expanded, neg_large_4d)
                 bias_max = bias_for_max.max(dim=-2)[0]  # [B*H, Tq, Tv]
             else:
                 bias_avg = bias_expanded.mean(dim=-2)
@@ -161,16 +168,15 @@ class TrimodalMultiheadAttention(nn.Module):
             fused_weights = fused_weights + lambda_param * bias_fused
 
             if self.dbg_print and self._dbg_cnt < self.dbg_max_batches:
-                with torch.no_grad():
-                    print("[DBG-D] fused_weights(mean/std/maxabs)=",
-                          fused_weights.mean().item(), fused_weights.std().item(), fused_weights.abs().max().item())
-                    print("[DBG-D] bias_fused(mean/std/maxabs)=",
-                          bias_fused.mean().item(), bias_fused.std().item(), bias_fused.abs().max().item())
-                    if torch.is_tensor(lambda_param):
-                        print("[DBG-D] lambda =", float(lambda_param.detach().item()))
+                print("[DBG-D] fused_weights(mean/std/maxabs)=",
+                      fused_weights.mean().item(), fused_weights.std().item(), fused_weights.abs().max().item())
+                print("[DBG-D] bias_fused(mean/std/maxabs)=",
+                      bias_fused.mean().item(), bias_fused.std().item(), bias_fused.abs().max().item())
+                print("[DBG-D] lambda =", float(lambda_param))
+
                 self._dbg_cnt += 1
 
-        # ===== 改法1新增：softmax 前做 temperature + clamp（注意：必须在 value mask 之前做，避免把 -1e9 clamp 掉）=====
+        # ===== 改法1新增：temperature 缩放 + clamp（在 value mask 之前做，避免把 padding 的极小值 clamp 掉）=====
         if (self.temperature is not None) and (self.temperature != 1.0):
             fused_weights = fused_weights / self.temperature
 
@@ -178,13 +184,24 @@ class TrimodalMultiheadAttention(nn.Module):
             fused_weights = fused_weights.clamp(-self.logit_clamp, self.logit_clamp)
 
         # 5) Value mask（输出级）
+        all_invalid = None
         if value_padding_mask is not None:
             mask_v = value_padding_mask.unsqueeze(1).unsqueeze(2)  # [B,1,1,Tv]
             mask_v = mask_v.repeat(1, self.num_heads, tgt_len, 1).view(bsz * self.num_heads, tgt_len, src_len_v)
-            fused_weights = fused_weights.masked_fill(~mask_v, -1e9)
+            neg_large_3d = torch.finfo(fused_weights.dtype).min
+            fused_weights = fused_weights.masked_fill(~mask_v, neg_large_3d)
+            all_invalid = (~mask_v).all(dim=-1, keepdim=True)  # [B*H, Tq, 1]
 
-        # 6) softmax -> dropout
-        fused_weights = F.softmax(fused_weights.float(), dim=-1).type_as(v)  # AMP safe
+        # 6) softmax -> dropout（NaN/Inf safe）
+        fw = torch.nan_to_num(fused_weights, nan=0.0,
+                              posinf=float(self.logit_clamp) if self.logit_clamp is not None else 20.0,
+                              neginf=-(float(self.logit_clamp) if self.logit_clamp is not None else 20.0))
+        fw = fw - fw.max(dim=-1, keepdim=True).values
+        fused_weights = torch.softmax(fw, dim=-1)
+
+        if all_invalid is not None and all_invalid.any():
+            fused_weights = fused_weights.masked_fill(all_invalid, 0.0)
+
         fused_weights = F.dropout(fused_weights, p=self.attn_dropout, training=self.training)
 
         # 7) 加权求和： [B*H,Tq,Tv] x [B*H,Tv,Dh] -> [B*H,Tq,Dh]
@@ -192,7 +209,7 @@ class TrimodalMultiheadAttention(nn.Module):
 
         # reshape back: [Tq, B, D]
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
-        attn = self.out_proj(attn)
+        attn = self.out_proj(attn).to(orig_dtype)
         return attn
 
 
