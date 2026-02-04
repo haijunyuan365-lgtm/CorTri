@@ -228,7 +228,7 @@ hyp_params.criterion = 'MSELoss'
 
 # 预训练模型路径
 if hyp_params.dataset == "mosei_senti":
-    hyp_params.corr_model_path = "/root/CorTri/pre_trained_models/correlation_model_1.pt"
+    hyp_params.corr_model_path = "/root/CorTri/pre_trained_models/correlation_model.pt"
 elif hyp_params.dataset == "ch_sims":
     hyp_params.corr_model_path = "/root/CorMulT/Correlation-Aware-Multimodal-Transformer/pre_trained_models/correlation_model_ch_sims.pt"
 
