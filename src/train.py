@@ -12,6 +12,7 @@ from src.eval_metrics import *
 # 引入 sklearn 指标库
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error
 from modality_correlation.correlation_loss import TripleLoss
+from src.AR_loss import ARLoss
 
 def initiate(hyp_params, train_loader, valid_loader, test_loader):
     model = getattr(models, hyp_params.model+'Model')(hyp_params)
@@ -25,7 +26,8 @@ def initiate(hyp_params, train_loader, valid_loader, test_loader):
     weight_decay=hyp_params.weight_decay
     )
     criterion = getattr(nn, hyp_params.criterion)()
-    
+    ar_criterion = ARLoss(reduction='mean')
+
     # 初始化对比损失函数 (Stage 2 不需要，但为了代码兼容性保留初始化，不调用即可)
     contrastive_criterion = TripleLoss(margin=hyp_params.margin if hasattr(hyp_params, 'margin') else 0.2)
     
@@ -36,6 +38,7 @@ def initiate(hyp_params, train_loader, valid_loader, test_loader):
                 'optimizer': optimizer,
                 'criterion': criterion,
                 'contrastive_criterion': contrastive_criterion,
+                'ar_criterion': ar_criterion,
                 'scheduler': scheduler,
                 'best_valid': -1}
     
@@ -80,7 +83,8 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
     criterion = settings['criterion']
     contrastive_criterion = settings['contrastive_criterion']
     scheduler = settings['scheduler']
-    
+    ar_criterion = settings.get('ar_criterion', None)
+    ar_weight = getattr(hyp_params, 'ar_weight', 0.0)  # 默认 0，不影响现有实验
     # 获取历史最佳指标
     best_valid = settings.get('best_valid', -1)
     
@@ -91,7 +95,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
     def train(model, optimizer, criterion, contrastive_criterion, epoch):
         epoch_loss = 0
         model.train()
-        num_batches = hyp_params.n_train // hyp_params.batch_size
+        num_batches = len(train_loader)
         proc_loss, proc_size = 0, 0
         start_time = time.time()
         
@@ -119,7 +123,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
                  print(f"Error in unpacking: {e}")
                  sys.exit(1)
 
-            model.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
                 
             if hyp_params.use_cuda:
                 with torch.cuda.device(0):
@@ -187,12 +191,21 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
                 eval_attr = eval_attr.view(-1, hyp_params.output_dim)
             
             task_loss = criterion(preds, eval_attr)
+            # 加入 AR Loss（如果有定义且权重大于 0）
+            ar_loss = torch.tensor(0.0, device=preds.device)
+            # 只对 mosei/mosi 这类回归标签启用（iemocap 不建议）
+            if ar_criterion is not None and ar_weight > 0 and hyp_params.dataset != 'iemocap':
+                ar_loss = ar_criterion(preds, eval_attr)
 
+            # 总损失
+            combined_loss = task_loss + ar_weight * ar_loss
             if beta > 0:
-                combined_loss = task_loss + beta * contrastive_loss
-            else:
-                # Stage 2: 纯净的任务损失
-                combined_loss = task_loss
+                combined_loss = combined_loss + beta * contrastive_loss
+
+            # 总损失
+            combined_loss = task_loss + ar_weight * ar_loss
+            if beta > 0:
+                combined_loss = combined_loss + beta * contrastive_loss
             
             combined_loss.backward()
             
@@ -206,9 +219,9 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
             if i_batch % hyp_params.log_interval == 0 and i_batch > 0:
                 avg_loss = proc_loss / proc_size
                 elapsed_time = time.time() - start_time
-                print('Epoch {:2d} | Batch {:3d}/{:3d} | Time {:4.0f}ms | Total {:.4f} (Task: {:.4f} | Cont: {:.4f})'.
-                      format(epoch, i_batch, num_batches, elapsed_time * 1000 / hyp_params.log_interval, 
-                             avg_loss, task_loss.item(), contrastive_loss.item()))
+                print('Epoch {:2d} | Batch {:3d}/{:3d} | Time {:4.0f}ms | Total {:.4f} (Task: {:.4f} | AR: {:.4f} | Cont: {:.4f})'.
+                    format(epoch, i_batch, num_batches, elapsed_time * 1000 / hyp_params.log_interval,
+                            avg_loss, task_loss.item(), ar_loss.item(), contrastive_loss.item()))
                 proc_loss, proc_size = 0, 0
                 start_time = time.time()
                 

@@ -69,6 +69,7 @@ parser.add_argument('--beta', type=float, default=0, help='Weight for contrastiv
 parser.add_argument('--margin', type=float, default=0.2, help='Margin for TripleLoss')
 # 在 main.py 的 argparse 部分加入这行
 parser.add_argument('--use_correlation', default=True, action='store_true', help='Use correlation model and loss (End-to-End training)')
+parser.add_argument('--ar_weight', type=float, default=0.0, help='Weight for AR loss in total loss')
 args = parser.parse_args()
 # args.data_path = "/root/CH-SIMS"
 # args.dataset = "ch_sims"
@@ -228,7 +229,7 @@ hyp_params.criterion = 'MSELoss'
 
 # 预训练模型路径
 if hyp_params.dataset == "mosei_senti":
-    hyp_params.corr_model_path = "/root/CorTri/pre_trained_models/correlation_model.pt"
+    hyp_params.corr_model_path = "/root/CorTri/pre_trained_models/correlation_model_85.5.pt"
 elif hyp_params.dataset == "ch_sims":
     hyp_params.corr_model_path = "/root/CorMulT/Correlation-Aware-Multimodal-Transformer/pre_trained_models/correlation_model_ch_sims.pt"
 
