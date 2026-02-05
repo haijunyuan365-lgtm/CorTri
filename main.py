@@ -13,7 +13,7 @@ from modality_correlation.correlation_dataset import UnifiedMultimodalDataset
 print("before main")
 print(gpustat.print_gpustat())
 
-parser = argparse.ArgumentParser(description='MOSEI Sentiment Analysis')
+parser = argparse.ArgumentParser(description='MOSEI Sentiment Analysis - Stage 2 Training')
 parser.add_argument('-f', default='', type=str)
 
 # Fixed
@@ -60,19 +60,18 @@ parser.add_argument('--name', type=str, default='mult', help='name of the trial 
 parser.add_argument('--perturbation_ratio', type=float, default=0.0, help='Proportion of perturbed samples used in the training set')
 parser.add_argument('--sample_ratio', type=float, default=1.0, help='Proportion of data retained in the training set')
 parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples to use')
-# 在 Tuning 部分添加
+
+# Tuning Extra
 parser.add_argument('--weight_decay', type=float, default=1e-4, help='weight decay (default: 1e-4)')
+
 # ======================================================
-# 新增: 端到端训练需要的超参数
+# Stage 2 Configs
 # ======================================================
-parser.add_argument('--beta', type=float, default=0, help='Weight for contrastive loss in total loss')
-parser.add_argument('--margin', type=float, default=0.2, help='Margin for TripleLoss')
-# 在 main.py 的 argparse 部分加入这行
-parser.add_argument('--use_correlation', default=True, action='store_true', help='Use correlation model and loss (End-to-End training)')
+# 恢复 --use_correlation 参数
+parser.add_argument('--use_correlation', default=True, action='store_true', help='Use correlation model prior (Stage 1 model)')
 parser.add_argument('--ar_weight', type=float, default=0.0, help='Weight for AR loss in total loss')
+
 args = parser.parse_args()
-# args.data_path = "/root/CH-SIMS"
-# args.dataset = "ch_sims"
 
 torch.manual_seed(args.seed)
 dataset = str.lower(args.dataset.strip())
@@ -88,7 +87,6 @@ output_dim_dict = {
     'mosei_senti': 1,
     'ch_sims': 1,
 }
-criterion_dict = {}
 
 torch.manual_seed(args.seed)
 random.seed(args.seed)
@@ -106,17 +104,13 @@ else:
     torch.manual_seed(args.seed)
 
 ####################################################################
-#
-# Load the dataset (aligned or non-aligned)
-#
+# Load the dataset
 ####################################################################
 print("before loading the data")
 print(gpustat.print_gpustat())
 print("Start loading the data....")
 
-# ======================================================
-# 修改 1: 关闭 for_correlation 
-# ======================================================
+# Stage 2: for_correlation=False
 train_data = UnifiedMultimodalDataset(
     dataset_path=args.data_path,
     data=args.dataset,
@@ -128,23 +122,17 @@ train_data = UnifiedMultimodalDataset(
     noise_std=0.05
 )
 
-print("train data loaded")
-print(gpustat.print_gpustat())
-
 valid_data = UnifiedMultimodalDataset(
     dataset_path=args.data_path,
     data=args.dataset,
     split_type='valid',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=False, # 关键修改
+    for_correlation=False,
     perturbation_ratio=0,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
 )
-
-print("valid data loaded")
-print(gpustat.print_gpustat())
 
 test_data = UnifiedMultimodalDataset(
     dataset_path=args.data_path,
@@ -152,52 +140,38 @@ test_data = UnifiedMultimodalDataset(
     split_type='test',
     if_align=args.aligned,
     max_samples=args.max_samples,
-    for_correlation=False, # 关键修改
+    for_correlation=False,
     perturbation_ratio=0,
     strategy_weights=[1/3, 1/3, 1/3],
     noise_std=0.05
 )
 
-print("test data loaded")
+print(f"Data Loaded: Train={len(train_data)}, Valid={len(valid_data)}, Test={len(test_data)}")
 print(gpustat.print_gpustat())
-
-# main.py 修改建议
 
 def get_collate_fn(hyp_params):
     def collate_fn(batch):
         """
-        Stage 2 专用 collate_fn:
-        只处理正样本 (Meta, Text, Audio, Vision, Label)
+        Stage 2 专用 collate_fn: (Metas, Text, Audio, Vision, Label)
         """
         max_text_len = hyp_params.l_len
         max_audio_len = hyp_params.a_len
         max_vision_len = hyp_params.v_len
 
-        # batch item 结构 (for_correlation=False 时):
-        # ((meta, text, audio, vision), label, (meta,))
-        
-        # 1. 提取 Meta 和 Label
         metas = [item[0][0] for item in batch]
-        labels = [item[1] for item in batch] # 注意：label 在索引 1
+        labels = [item[1] for item in batch]
 
-        # 2. 提取并截断特征
         texts = [item[0][1][:max_text_len] for item in batch]
         audios = [item[0][2][:max_audio_len] for item in batch]
         visions = [item[0][3][:max_vision_len] for item in batch]
         
-        # 3. Padding (仅正样本)
         texts_padded = pad_sequence(texts, batch_first=True)
         audios_padded = pad_sequence(audios, batch_first=True)
         visions_padded = pad_sequence(visions, batch_first=True)
 
-        # 4. Label Stack
         labels_tensor = torch.stack(labels).view(-1)
 
-        # 5. 返回精简的 Tuple (5个元素)
-        # 对应 src/train.py 中的解包逻辑
-        return (metas, 
-                texts_padded, audios_padded, visions_padded, 
-                labels_tensor)
+        return (metas, texts_padded, audios_padded, visions_padded, labels_tensor)
                 
     return collate_fn
 
@@ -206,9 +180,7 @@ if not args.aligned:
     print("### Note: You are running in unaligned mode.")
 
 ####################################################################
-#
 # Hyperparameters
-#
 ####################################################################
 
 hyp_params = args
@@ -222,10 +194,7 @@ hyp_params.batch_chunk = args.batch_chunk
 hyp_params.n_train, hyp_params.n_valid, hyp_params.n_test = len(train_data), len(valid_data), len(test_data)
 hyp_params.model = str.upper(args.model.strip())
 hyp_params.output_dim = output_dim_dict.get(dataset, 1)
-hyp_params.criterion = criterion_dict.get(dataset, 'L1Loss')
 hyp_params.criterion = 'MSELoss'
-# hyp_params.criterion = 'L1Loss'
-
 
 # 预训练模型路径
 if hyp_params.dataset == "mosei_senti":
@@ -233,33 +202,21 @@ if hyp_params.dataset == "mosei_senti":
 elif hyp_params.dataset == "ch_sims":
     hyp_params.corr_model_path = "/root/CorMulT/Correlation-Aware-Multimodal-Transformer/pre_trained_models/correlation_model_ch_sims.pt"
 
-# newly added
 if args.aligned:
     predefined_max_len = 100
 else:
-    predefined_max_len = 300  # 给 Unaligned 足够空间
+    predefined_max_len = 300 
 hyp_params.l_len = min(hyp_params.l_len, predefined_max_len)
 hyp_params.a_len = min(hyp_params.a_len, predefined_max_len)
 hyp_params.v_len = min(hyp_params.v_len, predefined_max_len)
 
 current_time = datetime.now().strftime("%Y%m%d_%H")
-hyp_params.name = ("DyCoTri" if hyp_params.use_correlation else "MulT") + "_" + current_time
+# 根据 use_correlation 参数动态命名
+hyp_params.name = ("DyCoTri" if hyp_params.use_correlation else "TriSAT_NoCorr") + "_" + current_time
 
-# ======================================================
-# 修改 3: 确保所有 Loader 使用正确的 Collate Fn
-# ======================================================
-print("before train_loader")
-print(gpustat.print_gpustat())
 train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, collate_fn=get_collate_fn(hyp_params))
-
-print("before valid_loader")
-print(gpustat.print_gpustat())
 valid_loader = DataLoader(valid_data, batch_size=args.batch_size, shuffle=False, collate_fn=get_collate_fn(hyp_params))
-
-print("before test_loader")
-print(gpustat.print_gpustat())
 test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, collate_fn=get_collate_fn(hyp_params))
-
 
 if __name__ == '__main__':
     test_loss = train.initiate(hyp_params, train_loader, valid_loader, test_loader)
