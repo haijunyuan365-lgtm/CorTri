@@ -9,6 +9,7 @@ from modules.position_embedding import SinusoidalPositionalEmbedding
 # 请务必保留 TrimodalMultiheadAttention 和 TriSATEncoderLayer 类的完整定义
 
 class TrimodalMultiheadAttention(nn.Module):
+    # (此处省略具体实现，保持原样，未修改)
     def __init__(self, embed_dim, num_heads, attn_dropout=0., bias=True,
                  use_experiment_d=True, dbg_print=True, dbg_max_batches=5,
                  normalize_kv=True, temperature=5.0, logit_clamp=20.0):
@@ -16,7 +17,7 @@ class TrimodalMultiheadAttention(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.attn_dropout = attn_dropout
-        self.use_experiment_d = use_experiment_d   # 保留字段，但 bias 注入改为 idea 的 pre-add
+        self.use_experiment_d = use_experiment_d
         self.dbg_print = dbg_print
         self.dbg_max_batches = dbg_max_batches
         self._dbg_cnt = 0
@@ -44,27 +45,20 @@ class TrimodalMultiheadAttention(nn.Module):
         tgt_len, bsz, embed_dim = query.size()
         src_len_k = key.size(0)
         src_len_v = value.size(0)
-
         q = F.linear(query, self.in_proj_weight[:embed_dim],
                      self.in_proj_bias[:embed_dim] if self.in_proj_bias is not None else None)
         k = F.linear(key, self.in_proj_weight[embed_dim:2*embed_dim],
                      self.in_proj_bias[embed_dim:2*embed_dim] if self.in_proj_bias is not None else None)
         v = F.linear(value, self.in_proj_weight[2*embed_dim:],
                      self.in_proj_bias[2*embed_dim:] if self.in_proj_bias is not None else None)
-
         q = q * self.scaling
-        q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # [B*H, Tq, d]
-        k = k.contiguous().view(src_len_k, bsz * self.num_heads, self.head_dim).transpose(0, 1) # [B*H, Tk, d]
-        v = v.contiguous().view(src_len_v, bsz * self.num_heads, self.head_dim).transpose(0, 1) # [B*H, Tv, d]
-
+        q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        k = k.contiguous().view(src_len_k, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        v = v.contiguous().view(src_len_v, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         if self.normalize_kv:
             k = F.normalize(k, p=2, dim=-1, eps=1e-8)
             v = F.normalize(v, p=2, dim=-1, eps=1e-8)
-
-        # S_sem : [B*H, Tq, Tk, Tv]
         attn_weights = torch.einsum('iat,ibt,ict->iabc', q, k, v)
-
-        # key mask expanded to [B*H, Tq, Tk, Tv] for masking during reduction over Tk
         mask_k_expanded = None
         if key_padding_mask is not None:
             mask_k_expanded = (
@@ -73,41 +67,17 @@ class TrimodalMultiheadAttention(nn.Module):
                 .view(bsz * self.num_heads, 1, src_len_k, 1)
                 .expand(-1, tgt_len, -1, src_len_v)
             )
-
-        # =========================
-        # (IDEA) bias pre-add: S_final = S_sem + lambda * C_cube
-        # =========================
-        if correlation_bias is not None:
-            # correlation_bias: [B, Tq, Tk, Tv] -> expand heads -> [B*H, Tq, Tk, Tv]
+        if (not self.use_experiment_d) and (correlation_bias is not None):
             bias_expanded = correlation_bias.unsqueeze(1).repeat(1, self.num_heads, 1, 1, 1)
             bias_expanded = bias_expanded.view(bsz * self.num_heads, tgt_len, src_len_k, src_len_v)
-
             attn_weights = attn_weights + lambda_param * bias_expanded
-
-            if self.dbg_print and self._dbg_cnt < self.dbg_max_batches:
-                with torch.no_grad():
-                    bw = (lambda_param * bias_expanded)
-                    print("[DBG-IDEA] attn_weights(mean/std/maxabs)=",
-                          attn_weights.mean().item(), attn_weights.std().item(), attn_weights.abs().max().item())
-                    print("[DBG-IDEA] lambda*bias(mean/std/maxabs)=",
-                          bw.mean().item(), bw.std().item(), bw.abs().max().item())
-                    if torch.is_tensor(lambda_param):
-                        print("[DBG-IDEA] lambda =", float(lambda_param.detach().item()))
-                self._dbg_cnt += 1
-
-        # =========================
-        # Reduce over K (dim=-2) -> weights over V
-        # =========================
         if mask_k_expanded is not None:
             attn_for_sum = attn_weights.masked_fill(~mask_k_expanded, 0.0)
         else:
             attn_for_sum = attn_weights
-
-        # sum over Tk
-        sum_score = attn_for_sum.sum(dim=-2, keepdim=True)  # [B*H, Tq, 1, Tv]
-
+        sum_score = attn_for_sum.sum(dim=-2, keepdim=True)
         if key_padding_mask is not None:
-            valid_lens_k = key_padding_mask.sum(dim=1).float().clamp_min(1.0)  # [B]
+            valid_lens_k = key_padding_mask.sum(dim=1).float().clamp_min(1.0)
             scale = (
                 valid_lens_k.view(bsz, 1, 1, 1)
                 .repeat(1, self.num_heads, tgt_len, src_len_v)
@@ -116,38 +86,58 @@ class TrimodalMultiheadAttention(nn.Module):
             avg_score = sum_score / scale
         else:
             avg_score = attn_weights.mean(dim=-2, keepdim=True)
-
         if mask_k_expanded is not None:
             attn_for_max = attn_weights.masked_fill(~mask_k_expanded, -1e9)
         else:
             attn_for_max = attn_weights
-        max_score = attn_for_max.max(dim=-2, keepdim=True)[0]  # [B*H, Tq, 1, Tv]
-
-        fused_weights = (avg_score + max_score).squeeze(-2)  # [B*H, Tq, Tv]
-
-        # temperature + clamp
+        max_score = attn_for_max.max(dim=-2, keepdim=True)[0]
+        fused_weights = (avg_score + max_score).squeeze(-2)
+        if self.use_experiment_d and (correlation_bias is not None):
+            bias_expanded = correlation_bias.unsqueeze(1).repeat(1, self.num_heads, 1, 1, 1)
+            bias_expanded = bias_expanded.view(bsz * self.num_heads, tgt_len, src_len_k, src_len_v)
+            if mask_k_expanded is not None:
+                bias_for_sum = bias_expanded.masked_fill(~mask_k_expanded, 0.0)
+                bias_sum = bias_for_sum.sum(dim=-2)
+                valid_lens_k = key_padding_mask.sum(dim=1).float().clamp_min(1.0)
+                scale2 = (
+                    valid_lens_k.view(bsz, 1, 1)
+                    .repeat(1, self.num_heads, tgt_len * src_len_v)
+                    .view(bsz * self.num_heads, tgt_len, src_len_v)
+                )
+                bias_avg = bias_sum / scale2
+                bias_for_max = bias_expanded.masked_fill(~mask_k_expanded, -1e9)
+                bias_max = bias_for_max.max(dim=-2)[0]
+            else:
+                bias_avg = bias_expanded.mean(dim=-2)
+                bias_max = bias_expanded.max(dim=-2)[0]
+            bias_fused = bias_avg + bias_max
+            fused_weights = fused_weights + lambda_param * bias_fused
+            if self.dbg_print and self._dbg_cnt < self.dbg_max_batches:
+                with torch.no_grad():
+                    print("[DBG-D] fused_weights(mean/std/maxabs)=",
+                          fused_weights.mean().item(), fused_weights.std().item(), fused_weights.abs().max().item())
+                    print("[DBG-D] bias_fused(mean/std/maxabs)=",
+                          bias_fused.mean().item(), bias_fused.std().item(), bias_fused.abs().max().item())
+                    if torch.is_tensor(lambda_param):
+                        print("[DBG-D] lambda =", float(lambda_param.detach().item()))
+                self._dbg_cnt += 1
         if (self.temperature is not None) and (self.temperature != 1.0):
             fused_weights = fused_weights / self.temperature
         if self.logit_clamp is not None:
             fused_weights = fused_weights.clamp(-self.logit_clamp, self.logit_clamp)
-
-        # mask V positions
         if value_padding_mask is not None:
-            mask_v = value_padding_mask.unsqueeze(1).unsqueeze(2)  # [B,1,1,Tv]
+            mask_v = value_padding_mask.unsqueeze(1).unsqueeze(2)
             mask_v = mask_v.repeat(1, self.num_heads, tgt_len, 1).view(bsz * self.num_heads, tgt_len, src_len_v)
             fused_weights = fused_weights.masked_fill(~mask_v, -1e9)
-
         fused_weights = F.softmax(fused_weights.float(), dim=-1).type_as(v)
         fused_weights = F.dropout(fused_weights, p=self.attn_dropout, training=self.training)
-
-        # output on V (unaligned-friendly)
-        attn = torch.bmm(fused_weights, v)  # [B*H, Tq, d]
+        attn = torch.bmm(fused_weights, v)
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
         return attn
 
-
 class TriSATEncoderLayer(nn.Module):
+    # (此处省略具体实现，保持原样，未修改)
     def __init__(self, embed_dim, num_heads, attn_dropout=0.1, dropout=0.1,
                  use_experiment_d=True, dbg_print=True):
         super().__init__()
@@ -181,7 +171,6 @@ class TriSATEncoderLayer(nn.Module):
         x = self.linear2(self.dropout(F.relu(self.linear1(x))))
         x = residual + self.dropout2(x)
         return x
-
 
 dataset_specific_configs = {
     "mosei_senti": {
@@ -223,7 +212,8 @@ class MULTModel(nn.Module):
         self.num_heads = hyp_params.num_heads
         self.layers = hyp_params.layers
         self.output_dim = hyp_params.output_dim
-
+        
+        # 1. 获取 use_correlation 标志
         self.use_correlation = getattr(hyp_params, 'use_correlation', False)
 
         self.attn_dropout = hyp_params.attn_dropout
@@ -241,6 +231,7 @@ class MULTModel(nn.Module):
 
         self.embed_positions = SinusoidalPositionalEmbedding(self.d_model)
 
+        # 2. 只有当 use_correlation 为 True 时才初始化并加载相关性模型
         if self.use_correlation:
             corr_config = dataset_specific_configs[hyp_params.dataset].copy()
             corr_config['text_in_dim'] = hyp_params.orig_d_l
@@ -254,6 +245,7 @@ class MULTModel(nn.Module):
             else:
                 print("WARNING: No pretrained path found. Using initialized weights.")
 
+            # 冻结 Stage 1 模型参数
             for param in self.corr_model.parameters():
                 param.requires_grad = False
             self.corr_model.eval()
@@ -273,11 +265,13 @@ class MULTModel(nn.Module):
             for _ in range(self.layers)
         ])
 
+        # 定义可学习权重 & λ
+        # 即使 use_correlation=False 也定义它们，防止 optimizer 报错，但在前向中不会使用
         self.w_tv = nn.Parameter(torch.tensor(0.33))
         self.w_ta = nn.Parameter(torch.tensor(0.33))
         self.w_va = nn.Parameter(torch.tensor(0.33))
         self.w_av = nn.Parameter(torch.tensor(0.33))
-        self.lambda_param = nn.Parameter(torch.tensor(1.0))
+        self.lambda_param = nn.Parameter(torch.tensor(2.0))
 
         combined_dim = 2 * self.d_model
         self.proj1 = nn.Linear(combined_dim, combined_dim)
@@ -334,10 +328,11 @@ class MULTModel(nn.Module):
 
         C_cube_stream1 = None
         C_cube_stream2 = None
-
+        
+        # 3. 前向传播中判断是否启用相关性
         if self.use_correlation:
             use_bias = True
-
+            
             w_s1 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_va]), dim=0)
             w_s2 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_av]), dim=0)
             lam = torch.sigmoid(self.lambda_param)
@@ -373,6 +368,7 @@ class MULTModel(nn.Module):
             R_VA_2 = C_VA.unsqueeze(1)
             C_cube_stream2 = w_s2[0] * R_TV_2 + w_s2[1] * R_TA_2 + w_s2[2] * R_VA_2
         else:
+            # 不启用相关性时，bias 为 None，lam 设为 0 (或随意值，因为 attention 内部会忽略)
             use_bias = False
             C_cube_stream1 = None
             C_cube_stream2 = None
