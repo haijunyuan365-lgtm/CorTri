@@ -139,12 +139,9 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
     def log_bias_params(model):
         if not hasattr(model, "lambda_param"):
             return
-        # 即使 use_correlation=False，lambda_param 可能还在，但没有意义
-        # 这里只做简单的打印，不影响训练逻辑
-        lam = torch.sigmoid(model.lambda_param.detach()).item()
-        w1 = torch.softmax(torch.stack([model.w_tv, model.w_ta, model.w_va]), dim=0).detach().cpu().numpy()
-        w2 = torch.softmax(torch.stack([model.w_tv, model.w_ta, model.w_av]), dim=0).detach().cpu().numpy()
-        print(f"[DBG] lambda(sigmoid)={lam:.4f}  w_s1(tv,ta,va)={w1}  w_s2(tv,ta,av)={w2}")
+        # 因为我们现在去掉了 sigmoid 的限制，直接使用原始的 lambda_param
+        lam = model.lambda_param.detach().item()
+        print(f"[DBG] lambda (raw) = {lam:.4f}")
         
     def evaluate(model, criterion, test=False):
         model.eval()
