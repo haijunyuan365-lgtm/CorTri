@@ -33,7 +33,7 @@ def initiate(hyp_params, train_loader, valid_loader, test_loader):
                 'criterion': criterion,
                 'ar_criterion': ar_criterion,
                 'scheduler': scheduler,
-                'best_valid': -1}
+                'best_valid': float('inf')}
     
     return train_model(settings, hyp_params, train_loader, valid_loader, test_loader)
 
@@ -71,7 +71,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
     ar_criterion = settings.get('ar_criterion', None)
     
     ar_weight = getattr(hyp_params, 'ar_weight', 0.0)  
-    best_valid = settings.get('best_valid', -1)
+    best_valid = settings.get('best_valid', float('inf'))
     
     def train(model, optimizer, criterion, epoch):
         epoch_loss = 0
@@ -215,11 +215,10 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         log_bias_params(model)
         print("-" * 95)
         
-        if v_f1 > best_valid:  
-            print(f"Saved best model! (Val F1: {v_f1:.4f} | Acc: {v_acc2:.4f})")
-            os.makedirs('pre_trained_models', exist_ok=True)
+        if v_mae < best_valid:
             torch.save(model.state_dict(), f'pre_trained_models/{hyp_params.name}.pt')
-            best_valid = v_f1
+            best_valid = v_mae
+            print(f"Saved best model! (Val MAE: {v_mae:.4f} | F1: {v_f1:.4f} | Acc2: {v_acc2:.4f})")
 
     print(f"\nTraining finished. Loading best model from pre_trained_models/{hyp_params.name}.pt...")
     model.load_state_dict(torch.load(f'pre_trained_models/{hyp_params.name}.pt'))

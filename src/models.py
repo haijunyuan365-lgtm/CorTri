@@ -11,7 +11,7 @@ from modules.position_embedding import SinusoidalPositionalEmbedding
 class TrimodalMultiheadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, attn_dropout=0., bias=True,
                  use_experiment_d=True, dbg_print=True, dbg_max_batches=5,
-                 normalize_kv=True, temperature=5.0, logit_clamp=20.0):
+                 normalize_kv=True, temperature=1.0, logit_clamp=None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -331,7 +331,17 @@ class MULTModel(nn.Module):
         mask_l = (x_l.abs().sum(dim=2) > 0)
         mask_a = (x_a.abs().sum(dim=2) > 0)
         mask_v = (x_v.abs().sum(dim=2) > 0)
-
+        
+        if (not hasattr(self, "_pad_dbg_cnt")):
+            self._pad_dbg_cnt = 0
+        if self._pad_dbg_cnt < 10:  # 只打印前 10 次，避免刷屏
+            with torch.no_grad():
+                pad_l = (~mask_l).float().mean().item()
+                pad_a = (~mask_a).float().mean().item()
+                pad_v = (~mask_v).float().mean().item()
+                print(f"[PAD_RATIO] L/A/V = {pad_l:.4f} / {pad_a:.4f} / {pad_v:.4f}")
+            self._pad_dbg_cnt += 1
+            
         C_cube_stream1 = None
         C_cube_stream2 = None
 
@@ -341,10 +351,26 @@ class MULTModel(nn.Module):
             w_s1 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_va]), dim=0)
             w_s2 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_av]), dim=0)
             lam = torch.sigmoid(self.lambda_param)
-
             with torch.no_grad():
                 self.corr_model.eval()
-                F_T_pp, F_A_pp, F_V_pp = self.corr_model(x_l, x_a, x_v)
+                text_pad  = ~mask_l
+                audio_pad = ~mask_a
+                vision_pad= ~mask_v
+                F_T_pp, F_A_pp, F_V_pp = self.corr_model(
+                    x_l, x_a, x_v,
+                    text_pad_mask=text_pad,
+                    audio_pad_mask=audio_pad,
+                    vision_pad_mask=vision_pad
+                )
+                if self._pad_dbg_cnt < 10:
+                    out_nomask = self.corr_model(x_l, x_a, x_v)
+                    out_mask   = self.corr_model(x_l, x_a, x_v,
+                                                text_pad_mask=text_pad,
+                                                audio_pad_mask=audio_pad,
+                                                vision_pad_mask=vision_pad)
+                    dA = (out_nomask[1] - out_mask[1]).abs().mean().item()
+                    dV = (out_nomask[2] - out_mask[2]).abs().mean().item()
+                    print("[CORR_DELTA] mean|Δ| A/V =", dA, dV)
 
             F_T_norm = F.normalize(F_T_pp, p=2, dim=-1)
             F_A_norm = F.normalize(F_A_pp, p=2, dim=-1)
