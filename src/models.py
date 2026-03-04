@@ -5,13 +5,10 @@ import os
 from modality_correlation.correlation_models import CorrelationModel
 from modules.position_embedding import SinusoidalPositionalEmbedding
 
-# ... (TriSATEncoderLayer 和 TrimodalMultiheadAttention 保持不变) ...
-# 请务必保留 TrimodalMultiheadAttention 和 TriSATEncoderLayer 类的完整定义
-
 class TrimodalMultiheadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, attn_dropout=0., bias=True,
                  use_experiment_d=True, dbg_print=True, dbg_max_batches=5,
-                 normalize_kv=True, temperature=1.0, logit_clamp=None):
+                 normalize_kv=True, temperature=5.0, logit_clamp=20.0):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -26,6 +23,10 @@ class TrimodalMultiheadAttention(nn.Module):
         self.normalize_kv = normalize_kv
         self.temperature = float(temperature) if temperature is not None else None
         self.logit_clamp = float(logit_clamp) if logit_clamp is not None else None
+        
+        # 【修改2：Softmax pooling 的可学习温度系数】
+        self.pool_tau = nn.Parameter(torch.tensor(1.0))
+        
         self.in_proj_weight = nn.Parameter(torch.Tensor(3 * embed_dim, embed_dim))
         self.in_proj_bias = nn.Parameter(torch.Tensor(3 * embed_dim)) if bias else None
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -96,34 +97,22 @@ class TrimodalMultiheadAttention(nn.Module):
                 self._dbg_cnt += 1
 
         # =========================
-        # Reduce over K (dim=-2) -> weights over V
+        # 【修改2：Softmax-weighted pooling over K (dim=-2) -> weights over V】
+        # 替代原始易受 Outlier 干扰的 avg+max 操作
         # =========================
         if mask_k_expanded is not None:
-            attn_for_sum = attn_weights.masked_fill(~mask_k_expanded, 0.0)
+            attn_for_pool = attn_weights.masked_fill(~mask_k_expanded, -1e9)
+            attn_valid = attn_weights.masked_fill(~mask_k_expanded, 0.0) # 保证 pad 处不会贡献 sum
         else:
-            attn_for_sum = attn_weights
+            attn_for_pool = attn_weights
+            attn_valid = attn_weights
 
-        # sum over Tk
-        sum_score = attn_for_sum.sum(dim=-2, keepdim=True)  # [B*H, Tq, 1, Tv]
-
-        if key_padding_mask is not None:
-            valid_lens_k = key_padding_mask.sum(dim=1).float().clamp_min(1.0)  # [B]
-            scale = (
-                valid_lens_k.view(bsz, 1, 1, 1)
-                .repeat(1, self.num_heads, tgt_len, src_len_v)
-                .view(bsz * self.num_heads, tgt_len, 1, src_len_v)
-            )
-            avg_score = sum_score / scale
-        else:
-            avg_score = attn_weights.mean(dim=-2, keepdim=True)
-
-        if mask_k_expanded is not None:
-            attn_for_max = attn_weights.masked_fill(~mask_k_expanded, -1e9)
-        else:
-            attn_for_max = attn_weights
-        max_score = attn_for_max.max(dim=-2, keepdim=True)[0]  # [B*H, Tq, 1, Tv]
-
-        fused_weights = (avg_score + max_score).squeeze(-2)  # [B*H, Tq, Tv]
+        # w = softmax(C / \tau)
+        tau = torch.clamp(self.pool_tau, min=0.01) # 保证温度系数不为0
+        pool_weights = F.softmax(attn_for_pool / tau, dim=-2)
+        
+        # C_pooled = \sum w * C
+        fused_weights = (pool_weights * attn_valid).sum(dim=-2) # 降维至 [B*H, Tq, Tv]
 
         # temperature + clamp
         if (self.temperature is not None) and (self.temperature != 1.0):
@@ -258,6 +247,29 @@ class MULTModel(nn.Module):
                 param.requires_grad = False
             self.corr_model.eval()
             print("Correlation model loaded and frozen.")
+
+            # 【修改1：方案B】为每个模态添加轻量级的 Projection Adapter
+            # 初始化时让最后一层权重和偏置为0，保证初始的输出完全等同于原本的 frozen 输出 (F_T_adp = F_T_pp + 0)
+            dim_out = corr_config['out_dim']
+            self.adapter_t = nn.Sequential(
+                nn.Linear(dim_out, dim_out),
+                nn.ReLU(),
+                nn.Linear(dim_out, dim_out)
+            )
+            self.adapter_a = nn.Sequential(
+                nn.Linear(dim_out, dim_out),
+                nn.ReLU(),
+                nn.Linear(dim_out, dim_out)
+            )
+            self.adapter_v = nn.Sequential(
+                nn.Linear(dim_out, dim_out),
+                nn.ReLU(),
+                nn.Linear(dim_out, dim_out)
+            )
+            for m in [self.adapter_t, self.adapter_a, self.adapter_v]:
+                nn.init.zeros_(m[-1].weight)
+                nn.init.zeros_(m[-1].bias)
+
         else:
             self.corr_model = None
             print("Running in STANDARD mode (No correlation model loaded).")
@@ -277,6 +289,11 @@ class MULTModel(nn.Module):
         self.w_ta = nn.Parameter(torch.tensor(0.33))
         self.w_va = nn.Parameter(torch.tensor(0.33))
         self.w_av = nn.Parameter(torch.tensor(0.33))
+        
+        # 【修改3：乘积项权重】
+        self.w_inter_s1 = nn.Parameter(torch.tensor(0.1))
+        self.w_inter_s2 = nn.Parameter(torch.tensor(0.1))
+        
         self.lambda_param = nn.Parameter(torch.tensor(1.0))
 
         combined_dim = 2 * self.d_model
@@ -331,50 +348,30 @@ class MULTModel(nn.Module):
         mask_l = (x_l.abs().sum(dim=2) > 0)
         mask_a = (x_a.abs().sum(dim=2) > 0)
         mask_v = (x_v.abs().sum(dim=2) > 0)
-        
-        if (not hasattr(self, "_pad_dbg_cnt")):
-            self._pad_dbg_cnt = 0
-        if self._pad_dbg_cnt < 10:  # 只打印前 10 次，避免刷屏
-            with torch.no_grad():
-                pad_l = (~mask_l).float().mean().item()
-                pad_a = (~mask_a).float().mean().item()
-                pad_v = (~mask_v).float().mean().item()
-                print(f"[PAD_RATIO] L/A/V = {pad_l:.4f} / {pad_a:.4f} / {pad_v:.4f}")
-            self._pad_dbg_cnt += 1
-            
+
         C_cube_stream1 = None
         C_cube_stream2 = None
 
         if self.use_correlation:
             use_bias = True
 
-            w_s1 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_va]), dim=0)
-            w_s2 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_av]), dim=0)
+            # 【修改3】加入 inter 项联合 softmax
+            w_s1 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_va, self.w_inter_s1]), dim=0)
+            w_s2 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_av, self.w_inter_s2]), dim=0)
             lam = torch.sigmoid(self.lambda_param)
+
             with torch.no_grad():
                 self.corr_model.eval()
-                text_pad  = ~mask_l
-                audio_pad = ~mask_a
-                vision_pad= ~mask_v
-                F_T_pp, F_A_pp, F_V_pp = self.corr_model(
-                    x_l, x_a, x_v,
-                    text_pad_mask=text_pad,
-                    audio_pad_mask=audio_pad,
-                    vision_pad_mask=vision_pad
-                )
-                if self._pad_dbg_cnt < 10:
-                    out_nomask = self.corr_model(x_l, x_a, x_v)
-                    out_mask   = self.corr_model(x_l, x_a, x_v,
-                                                text_pad_mask=text_pad,
-                                                audio_pad_mask=audio_pad,
-                                                vision_pad_mask=vision_pad)
-                    dA = (out_nomask[1] - out_mask[1]).abs().mean().item()
-                    dV = (out_nomask[2] - out_mask[2]).abs().mean().item()
-                    print("[CORR_DELTA] mean|Δ| A/V =", dA, dV)
+                F_T_pp, F_A_pp, F_V_pp = self.corr_model(x_l, x_a, x_v)
 
-            F_T_norm = F.normalize(F_T_pp, p=2, dim=-1)
-            F_A_norm = F.normalize(F_A_pp, p=2, dim=-1)
-            F_V_norm = F.normalize(F_V_pp, p=2, dim=-1)
+            # 【修改1：方案B】让特征经过可学习的残差 Adapter
+            F_T_adp = F_T_pp + self.adapter_t(F_T_pp)
+            F_A_adp = F_A_pp + self.adapter_a(F_A_pp)
+            F_V_adp = F_V_pp + self.adapter_v(F_V_pp)
+
+            F_T_norm = F.normalize(F_T_adp, p=2, dim=-1)
+            F_A_norm = F.normalize(F_A_adp, p=2, dim=-1)
+            F_V_norm = F.normalize(F_V_adp, p=2, dim=-1)
 
             C_TA = torch.bmm(F_T_norm, F_A_norm.transpose(1, 2))
             C_TV = torch.bmm(F_T_norm, F_V_norm.transpose(1, 2))
@@ -389,15 +386,20 @@ class MULTModel(nn.Module):
             C_TV = C_TV * (m_l.unsqueeze(2) * m_v.unsqueeze(1))
             C_AV = C_AV * (m_a.unsqueeze(2) * m_v.unsqueeze(1))
 
-            R_TV_1 = C_TV.unsqueeze(2)
-            R_TA_1 = C_TA.unsqueeze(3)
-            R_AV_1 = C_AV.unsqueeze(1)
-            C_cube_stream1 = w_s1[0] * R_TV_1 + w_s1[1] * R_TA_1 + w_s1[2] * R_AV_1
+            R_TV_1 = C_TV.unsqueeze(2)  # [B, Tq, 1, Tv]
+            R_TA_1 = C_TA.unsqueeze(3)  # [B, Tq, Tk, 1]
+            R_AV_1 = C_AV.unsqueeze(1)  # [B, 1, Tk, Tv]
+            
+            # 【修改3】多模态乘积交互项 delta * (C_TV * C_TA)
+            inter_1 = R_TV_1 * R_TA_1
+            C_cube_stream1 = w_s1[0] * R_TV_1 + w_s1[1] * R_TA_1 + w_s1[2] * R_AV_1 + w_s1[3] * inter_1
 
             R_TV_2 = C_TV.unsqueeze(3)
             R_TA_2 = C_TA.unsqueeze(2)
             R_VA_2 = C_VA.unsqueeze(1)
-            C_cube_stream2 = w_s2[0] * R_TV_2 + w_s2[1] * R_TA_2 + w_s2[2] * R_VA_2
+            
+            inter_2 = R_TV_2 * R_TA_2
+            C_cube_stream2 = w_s2[0] * R_TV_2 + w_s2[1] * R_TA_2 + w_s2[2] * R_VA_2 + w_s2[3] * inter_2
         else:
             use_bias = False
             C_cube_stream1 = None
