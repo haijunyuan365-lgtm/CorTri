@@ -31,6 +31,17 @@ dataset_specific_configs = {
         "dim_feedforward": 256,
         "dropout": 0.1,
         "out_dim": 64,
+    },
+    "mosi": {
+        "text_in_dim": 768,
+        "audio_in_dim": 5,   # 从 check_pkl 中看到的 5
+        "vision_in_dim": 20, # 从 check_pkl 中看到的 20
+        "d_model": 128,
+        "num_layers": 3,
+        "num_heads": 4,
+        "dim_feedforward": 256,
+        "dropout": 0.1,
+        "out_dim": 64,
     }
 }
 

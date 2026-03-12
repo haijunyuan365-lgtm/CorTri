@@ -37,6 +37,17 @@ dataset_specific_configs = {
         "dim_feedforward": 256,
         "dropout": 0.1,
         "out_dim": 64,
+    },
+    "mosi": {
+        "text_in_dim": 768,
+        "audio_in_dim": 5,   # 从 check_pkl 中看到的 5
+        "vision_in_dim": 20, # 从 check_pkl 中看到的 20
+        "d_model": 128,
+        "num_layers": 3,
+        "num_heads": 4,
+        "dim_feedforward": 256,
+        "dropout": 0.1,
+        "out_dim": 64,
     }
 }
 
@@ -92,24 +103,34 @@ def get_collate_fn(max_len=400):
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Start Stage 1 Training for {args.dataset_name}...")
-
+    
+    # 智能解析你命令行传入的完整 pkl 路径
+    if args.data_path.endswith('.pkl'):
+        dataset_dir = os.path.dirname(args.data_path)
+        pkl_name = os.path.basename(args.data_path)
+    else:
+        dataset_dir = args.data_path
+        pkl_name = "mosi-unaligned_50.pkl"
+        
     train_data = UnifiedMultimodalDataset(
-        dataset_path=args.data_path,
+        dataset_path=dataset_dir,
         data=args.dataset_name,
         split_type='train',
         if_align=False,
-        for_correlation=True,
+        max_samples=args.max_samples,
+        for_correlation=True,               
         perturbation_ratio=args.perturbation_ratio,
-        noise_std=0.1
+        pkl_filename=pkl_name    # <--- 传递解析出的文件名
     )
     valid_data = UnifiedMultimodalDataset(
-        dataset_path=args.data_path,
+        dataset_path=dataset_dir,
         data=args.dataset_name,
         split_type='valid',
         if_align=False,
+        max_samples=args.max_samples,
         for_correlation=True,
-        perturbation_ratio=0.0,
-        noise_std=0.1
+        perturbation_ratio=0.0,  
+        pkl_filename=pkl_name    # <--- 传递解析出的文件名
     )
 
     train_loader = DataLoader(
@@ -244,7 +265,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='/root/autodl-fs')
-    parser.add_argument('--dataset_name', type=str, default='mosei_senti')
+    parser.add_argument('--dataset_name', type=str, default='mosi')
     parser.add_argument('--margin', type=float, default=0.2)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=24)

@@ -27,12 +27,70 @@ class Multimodal_Datasets(Dataset):
             self._load_mosei(dataset_path)
         elif self.data == 'ch_sims':
             self._load_ch_sims(dataset_path, pkl_filename)
+        elif self.data == 'mosi':
+            self._load_mosi(dataset_path, pkl_filename) # 新增的 MOSI 分支
         else:
             raise ValueError(f"Unsupported dataset type: {self.data}")
 
         self.n_modalities = 3  # Vision, Text, Audio
         self.num_samples = len(self.labels)
 
+    def _load_mosi(self, dataset_path, pkl_filename):
+        file_path = os.path.join(dataset_path, pkl_filename)
+        # 支持直接传入完整的 .pkl 路径
+        if not os.path.exists(file_path) and dataset_path.endswith('.pkl'):
+            file_path = dataset_path
+
+        with open(file_path, "rb") as f:
+            data_dict = pickle.load(f)
+
+        # 兼容外层是否有 'dataset' 键的情况
+        if 'dataset' in data_dict and self.split_type in data_dict['dataset']:
+            subset = data_dict['dataset'][self.split_type]
+        else:
+            subset = data_dict[self.split_type]
+        
+        if self.max_samples is not None:
+            subset_indices = range(min(self.max_samples, len(subset["id"])))
+        else:
+            subset_indices = range(len(subset["id"]))
+
+        text_list, audio_list, vision_list, labels_list, meta_list = [], [], [], [], []
+
+        for i in subset_indices:
+            text_feat = subset["text"][i]    # (seq_len, 768)
+            audio_feat = subset["audio"][i]  # (seq_len, 5)
+            vision_feat = subset["vision"][i]# (seq_len, 20)
+            
+            label_raw = subset["regression_labels"][i]
+
+            text_tensor = torch.tensor(text_feat, dtype=torch.float32)
+            audio_tensor = torch.tensor(audio_feat, dtype=torch.float32)
+            vision_tensor = torch.tensor(vision_feat, dtype=torch.float32)
+            label_tensor = torch.tensor(label_raw, dtype=torch.float32)
+
+            # 数据清洗：替换潜在的 NaN 或 Inf 为 0
+            text_tensor = torch.nan_to_num(text_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+            audio_tensor = torch.nan_to_num(audio_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+            vision_tensor = torch.nan_to_num(vision_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Z-score 数据标准化：保证不破坏 CorMulT 原始网络结构的同时解决训练时出 NaN 的问题
+            text_tensor = (text_tensor - text_tensor.mean(dim=0)) / (text_tensor.std(dim=0) + 1e-8)
+            audio_tensor = (audio_tensor - audio_tensor.mean(dim=0)) / (audio_tensor.std(dim=0) + 1e-8)
+            vision_tensor = (vision_tensor - vision_tensor.mean(dim=0)) / (vision_tensor.std(dim=0) + 1e-8)
+
+            text_list.append(text_tensor)
+            audio_list.append(audio_tensor)
+            vision_list.append(vision_tensor)
+            labels_list.append(label_tensor)
+            meta_list.append(subset["id"][i])
+
+        self.text = text_list
+        self.audio = audio_list
+        self.vision = vision_list
+        self.labels = labels_list
+        self.meta = meta_list
+        
     def _load_mosei(self, dataset_path):
             """
             修正版：自动检测 .pkl 文件中的键名 (labels vs regression_labels)

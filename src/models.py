@@ -24,8 +24,11 @@ class TrimodalMultiheadAttention(nn.Module):
         self.temperature = float(temperature) if temperature is not None else None
         self.logit_clamp = float(logit_clamp) if logit_clamp is not None else None
         
-        # 【修改2：Softmax pooling 的可学习温度系数】
+        # 【原修改2：Softmax pooling 的可学习温度系数】
         self.pool_tau = nn.Parameter(torch.tensor(1.0))
+        
+        # 【新增优化2：控制最终 Value 注意力分布锐度的可学习温度，防止注意力稀释】
+        self.val_tau = nn.Parameter(torch.tensor(1.0))
         
         self.in_proj_weight = nn.Parameter(torch.Tensor(3 * embed_dim, embed_dim))
         self.in_proj_bias = nn.Parameter(torch.Tensor(3 * embed_dim)) if bias else None
@@ -97,7 +100,7 @@ class TrimodalMultiheadAttention(nn.Module):
                 self._dbg_cnt += 1
 
         # =========================
-        # 【修改2：Softmax-weighted pooling over K (dim=-2) -> weights over V】
+        # Softmax-weighted pooling over K (dim=-2) -> weights over V
         # 替代原始易受 Outlier 干扰的 avg+max 操作
         # =========================
         if mask_k_expanded is not None:
@@ -114,9 +117,10 @@ class TrimodalMultiheadAttention(nn.Module):
         # C_pooled = \sum w * C
         fused_weights = (pool_weights * attn_valid).sum(dim=-2) # 降维至 [B*H, Tq, Tv]
 
-        # temperature + clamp
-        if (self.temperature is not None) and (self.temperature != 1.0):
-            fused_weights = fused_weights / self.temperature
+        # 【应用优化2：使用独立的可学习锐化温度，避免长序列的注意力被过度稀释】
+        tau_v = torch.clamp(self.val_tau, min=0.01)
+        fused_weights = fused_weights / tau_v
+        
         if self.logit_clamp is not None:
             fused_weights = fused_weights.clamp(-self.logit_clamp, self.logit_clamp)
 
@@ -194,6 +198,17 @@ dataset_specific_configs = {
         "dim_feedforward": 256,
         "dropout": 0.1,
         "out_dim": 64,
+    },
+    "mosi": {
+        "text_in_dim": 768,
+        "audio_in_dim": 5,   # 从 check_pkl 中看到的 5
+        "vision_in_dim": 20, # 从 check_pkl 中看到的 20
+        "d_model": 128,
+        "num_layers": 3,
+        "num_heads": 4,
+        "dim_feedforward": 256,
+        "dropout": 0.1,
+        "out_dim": 64,
     }
 }
 
@@ -219,9 +234,10 @@ class MULTModel(nn.Module):
         self.embed_dropout = hyp_params.embed_dropout
         self.out_dropout = hyp_params.out_dropout
 
+        # 【应用优化1：引入核大小为3的局部时序平滑，padding=1 保证长度依然是 500】
         self.proj_l = nn.Conv1d(self.orig_d_l, self.d_model, kernel_size=1, padding=0, bias=False)
-        self.proj_a = nn.Conv1d(self.orig_d_a, self.d_model, kernel_size=1, padding=0, bias=False)
-        self.proj_v = nn.Conv1d(self.orig_d_v, self.d_model, kernel_size=1, padding=0, bias=False)
+        self.proj_a = nn.Conv1d(self.orig_d_a, self.d_model, kernel_size=3, padding=1, bias=False)
+        self.proj_v = nn.Conv1d(self.orig_d_v, self.d_model, kernel_size=3, padding=1, bias=False)
 
         self.missing_a = nn.Parameter(torch.zeros(1, 1, self.d_model))
         self.missing_v = nn.Parameter(torch.zeros(1, 1, self.d_model))
@@ -248,8 +264,7 @@ class MULTModel(nn.Module):
             self.corr_model.eval()
             print("Correlation model loaded and frozen.")
 
-            # 【修改1：方案B】为每个模态添加轻量级的 Projection Adapter
-            # 初始化时让最后一层权重和偏置为0，保证初始的输出完全等同于原本的 frozen 输出 (F_T_adp = F_T_pp + 0)
+            # 方案B：为每个模态添加轻量级的 Projection Adapter
             dim_out = corr_config['out_dim']
             self.adapter_t = nn.Sequential(
                 nn.Linear(dim_out, dim_out),
@@ -290,7 +305,6 @@ class MULTModel(nn.Module):
         self.w_va = nn.Parameter(torch.tensor(0.33))
         self.w_av = nn.Parameter(torch.tensor(0.33))
         
-        # 【修改3：乘积项权重】
         self.w_inter_s1 = nn.Parameter(torch.tensor(0.1))
         self.w_inter_s2 = nn.Parameter(torch.tensor(0.1))
         
@@ -345,9 +359,11 @@ class MULTModel(nn.Module):
         return out
 
     def forward(self, x_l, x_a, x_v):
-        mask_l = (x_l.abs().sum(dim=2) > 0)
-        mask_a = (x_a.abs().sum(dim=2) > 0)
-        mask_v = (x_v.abs().sum(dim=2) > 0)
+        # 【应用优化3：引入容差阈值 epsilon，防止浮点误差导致 Padding 泄漏】
+        epsilon = 1e-5
+        mask_l = (x_l.abs().sum(dim=2) > epsilon)
+        mask_a = (x_a.abs().sum(dim=2) > epsilon)
+        mask_v = (x_v.abs().sum(dim=2) > epsilon)
 
         C_cube_stream1 = None
         C_cube_stream2 = None
@@ -355,16 +371,22 @@ class MULTModel(nn.Module):
         if self.use_correlation:
             use_bias = True
 
-            # 【修改3】加入 inter 项联合 softmax
             w_s1 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_va, self.w_inter_s1]), dim=0)
             w_s2 = torch.softmax(torch.stack([self.w_tv, self.w_ta, self.w_av, self.w_inter_s2]), dim=0)
             lam = torch.sigmoid(self.lambda_param)
 
             with torch.no_grad():
                 self.corr_model.eval()
-                F_T_pp, F_A_pp, F_V_pp = self.corr_model(x_l, x_a, x_v)
+                text_pad = ~mask_l
+                audio_pad = ~mask_a
+                vision_pad = ~mask_v
+                F_T_pp, F_A_pp, F_V_pp = self.corr_model(
+                    x_l, x_a, x_v,
+                    text_pad_mask=text_pad,
+                    audio_pad_mask=audio_pad,
+                    vision_pad_mask=vision_pad,
+                )
 
-            # 【修改1：方案B】让特征经过可学习的残差 Adapter
             F_T_adp = F_T_pp + self.adapter_t(F_T_pp)
             F_A_adp = F_A_pp + self.adapter_a(F_A_pp)
             F_V_adp = F_V_pp + self.adapter_v(F_V_pp)
@@ -390,7 +412,6 @@ class MULTModel(nn.Module):
             R_TA_1 = C_TA.unsqueeze(3)  # [B, Tq, Tk, 1]
             R_AV_1 = C_AV.unsqueeze(1)  # [B, 1, Tk, Tv]
             
-            # 【修改3】多模态乘积交互项 delta * (C_TV * C_TA)
             inter_1 = R_TV_1 * R_TA_1
             C_cube_stream1 = w_s1[0] * R_TV_1 + w_s1[1] * R_TA_1 + w_s1[2] * R_AV_1 + w_s1[3] * inter_1
 

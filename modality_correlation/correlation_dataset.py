@@ -32,6 +32,7 @@ class UnifiedMultimodalDataset(Multimodal_Datasets):
                  # NEW: negative generation mode
                  neg_mode='independent',  # 'independent' (recommended) or 'original'
                  neg_strategy_weights=(0.6, 0.2, 0.2),  # A/B/C weights for each modality neg
+                 pkl_filename="mosi-unaligned_50.pkl"  # <--- 新增
                  ):
         """
         Args:
@@ -52,7 +53,7 @@ class UnifiedMultimodalDataset(Multimodal_Datasets):
                 When neg_mode='independent', per-modality choose A/B/C with these weights.
                 Default: more often cross-sample replacement (A), sometimes shift (B) or noise (C).
         """
-        super(UnifiedMultimodalDataset, self).__init__(dataset_path, data, split_type, if_align, max_samples)
+        super(UnifiedMultimodalDataset, self).__init__(dataset_path, data, split_type, if_align, max_samples, pkl_filename=pkl_filename)
 
         self.for_correlation = for_correlation
         self.perturbation_ratio = perturbation_ratio
