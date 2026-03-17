@@ -58,6 +58,14 @@ class CorrelationModel(nn.Module):
         self.audio_out_fc = nn.Linear(d_model, out_dim)
         self.vision_out_fc = nn.Linear(d_model, out_dim)
 
+    # 在 CorrelationModel 类内部添加这个辅助函数
+    def _masked_mean_pool(self, seq, mask):
+        if mask is not None:
+            valid = (~mask).float().unsqueeze(-1)  # [B, T, 1]
+            num = valid.sum(dim=1).clamp(min=1.0)
+            return (seq * valid).sum(dim=1) / num  # 输出 [B, D]
+        return seq.mean(dim=1)
+    
     def forward(
         self,
         text, audio, vision,
@@ -82,11 +90,11 @@ class CorrelationModel(nn.Module):
         a_enc = self.audio_encoder(a_emb, src_key_padding_mask=audio_pad_mask)
         v_enc = self.vision_encoder(v_emb, src_key_padding_mask=vision_pad_mask)
 
-        t_out = self.text_out_fc(t_enc)
+        _out = self.text_out_fc(t_enc) # [B, T, D]
         a_out = self.audio_out_fc(a_enc)
         v_out = self.vision_out_fc(v_enc)
 
-        # 额外保险：把 padding 位置输出强制置 0（避免后续 loss/统计误用）
+        # 额外保险：把 padding 位置输出强制置 0
         if text_pad_mask is not None:
             t_out = t_out.masked_fill(text_pad_mask.unsqueeze(-1), 0.0)
         if audio_pad_mask is not None:
@@ -94,4 +102,9 @@ class CorrelationModel(nn.Module):
         if vision_pad_mask is not None:
             v_out = v_out.masked_fill(vision_pad_mask.unsqueeze(-1), 0.0)
 
-        return t_out, a_out, v_out
+        # 【消融实验核心修改】：在这里直接将特征压缩为样本级全局特征 [B, D]
+        t_global = self._masked_mean_pool(t_out, text_pad_mask)
+        a_global = self._masked_mean_pool(a_out, audio_pad_mask)
+        v_global = self._masked_mean_pool(v_out, vision_pad_mask)
+
+        return t_global, a_global, v_global

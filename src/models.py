@@ -380,6 +380,7 @@ class MULTModel(nn.Module):
                 text_pad = ~mask_l
                 audio_pad = ~mask_a
                 vision_pad = ~mask_v
+                # 现在的 F_*_pp 形状是 [B, D]
                 F_T_pp, F_A_pp, F_V_pp = self.corr_model(
                     x_l, x_a, x_v,
                     text_pad_mask=text_pad,
@@ -387,6 +388,7 @@ class MULTModel(nn.Module):
                     vision_pad_mask=vision_pad,
                 )
 
+            # Adapter 依然可以完美处理 [B, D] 的输入
             F_T_adp = F_T_pp + self.adapter_t(F_T_pp)
             F_A_adp = F_A_pp + self.adapter_a(F_A_pp)
             F_V_adp = F_V_pp + self.adapter_v(F_V_pp)
@@ -395,9 +397,20 @@ class MULTModel(nn.Module):
             F_A_norm = F.normalize(F_A_adp, p=2, dim=-1)
             F_V_norm = F.normalize(F_V_adp, p=2, dim=-1)
 
-            C_TA = torch.bmm(F_T_norm, F_A_norm.transpose(1, 2))
-            C_TV = torch.bmm(F_T_norm, F_V_norm.transpose(1, 2))
-            C_AV = torch.bmm(F_A_norm, F_V_norm.transpose(1, 2))
+            # 【消融实验核心】：计算全局标量相关性 
+            # 维度运算: [B, 1, D] bmm [B, D, 1] -> [B, 1, 1]
+            scalar_TA = torch.bmm(F_T_norm.unsqueeze(1), F_A_norm.unsqueeze(2)) 
+            scalar_TV = torch.bmm(F_T_norm.unsqueeze(1), F_V_norm.unsqueeze(2))
+            scalar_AV = torch.bmm(F_A_norm.unsqueeze(1), F_V_norm.unsqueeze(2))
+
+            # 扩展回矩阵维度 [B, T, T]，以便后续能够直接注入到注意力偏置中
+            T_l = x_l.size(1)
+            T_a = x_a.size(1)
+            T_v = x_v.size(1)
+
+            C_TA = scalar_TA.expand(-1, T_l, T_a)
+            C_TV = scalar_TV.expand(-1, T_l, T_v)
+            C_AV = scalar_AV.expand(-1, T_a, T_v)
             C_VA = C_AV.transpose(1, 2)
 
             m_l = mask_l.float()

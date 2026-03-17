@@ -230,6 +230,8 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         eval_mosei_senti(results, truths, True)
     elif hyp_params.dataset == 'ch_sims':
         eval_ch_sims(results, truths, True)
+    elif hyp_params.dataset == 'mosi':
+        eval_mosei_senti(results, truths, True)
 
     sys.stdout.flush()
     return best_valid

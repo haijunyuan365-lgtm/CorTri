@@ -265,9 +265,9 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='/root/autodl-fs')
-    parser.add_argument('--dataset_name', type=str, default='mosi')
+    parser.add_argument('--dataset_name', type=str, default='mosei_senti', choices=['mosei_senti', 'ch_sims', 'mosi'])
     parser.add_argument('--margin', type=float, default=0.2)
-    parser.add_argument('--num_epochs', type=int, default=50)
+    parser.add_argument('--num_epochs', type=int, default=40)
     parser.add_argument('--batch_size', type=int, default=24)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--model_save_name', type=str, default='correlation_model')

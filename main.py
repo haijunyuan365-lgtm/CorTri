@@ -86,6 +86,7 @@ use_cuda = False
 output_dim_dict = {
     'mosei_senti': 1,
     'ch_sims': 1,
+    'mosi': 1,
 }
 
 torch.manual_seed(args.seed)
@@ -199,8 +200,8 @@ hyp_params.criterion = 'MSELoss'
 # 预训练模型路径
 if hyp_params.dataset == "mosei_senti":
     hyp_params.corr_model_path = "/root/CorTri/pre_trained_models/correlation_model_85.5.pt"
-elif hyp_params.dataset == "ch_sims":
-    hyp_params.corr_model_path = "/root/CorMulT/Correlation-Aware-Multimodal-Transformer/pre_trained_models/correlation_model_ch_sims.pt"
+elif hyp_params.dataset == "mosi":
+    hyp_params.corr_model_path = "/root/CorTri/pre_trained_models/correlation_model_mosi.pt"
 
 if args.aligned:
     predefined_max_len = 100
