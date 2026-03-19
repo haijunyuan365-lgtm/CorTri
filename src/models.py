@@ -362,7 +362,16 @@ class MULTModel(nn.Module):
 
             with torch.no_grad():
                 self.corr_model.eval()
-                F_T_pp, F_A_pp, F_V_pp = self.corr_model(x_l, x_a, x_v)
+                # corr_model 的 TransformerEncoder 依赖 pad_mask，否则 padding token 会污染有效 token
+                text_pad = ~mask_l
+                audio_pad = ~mask_a
+                vision_pad = ~mask_v
+                F_T_pp, F_A_pp, F_V_pp = self.corr_model(
+                    x_l, x_a, x_v,
+                    text_pad_mask=text_pad,
+                    audio_pad_mask=audio_pad,
+                    vision_pad_mask=vision_pad,
+                )
 
             # 【修改1：方案B】让特征经过可学习的残差 Adapter
             F_T_adp = F_T_pp + self.adapter_t(F_T_pp)

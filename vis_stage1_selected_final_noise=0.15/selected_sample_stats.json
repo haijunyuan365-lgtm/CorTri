@@ -1,0 +1,47 @@
+{
+  "dataset_name": "mosei_senti",
+  "split": "valid",
+  "idx": 1840,
+  "sample_id": "y8HXGm1-Ecw$_$5",
+  "label": -1.6666666269302368,
+  "text_len": 36,
+  "audio_len": 236,
+  "vision_len": 177,
+  "vision_noise_std": 0.15,
+  "raw_text": "This can be very dangerous for our face, and it will actually even show dark circles, and imperfections, scars, even more prevalently than they would have before.",
+  "mean_orig": {
+    "TA": 0.8151723742485046,
+    "TV": 0.8056752681732178,
+    "AV": 0.9249029755592346
+  },
+  "mean_pert": {
+    "TA": 0.8151723742485046,
+    "TV": 0.7640550136566162,
+    "AV": 0.8820353150367737
+  },
+  "align_orig": {
+    "TA": 0.8363702297210693,
+    "TV": 0.8242394924163818,
+    "AV": 0.9280157685279846
+  },
+  "align_pert": {
+    "TA": 0.8363702297210693,
+    "TV": 0.7867450714111328,
+    "AV": 0.8878272175788879
+  },
+  "align_drop": {
+    "TA": 0.0,
+    "TV": 0.03749442100524902,
+    "AV": 0.04018855094909668
+  },
+  "overall": {
+    "orig_mean_overall": 0.8485835393269857,
+    "pert_mean_overall": 0.8204209009806315,
+    "orig_align_overall": 0.8628751635551453,
+    "pert_align_overall": 0.8369808395703634
+  },
+  "heatmap_percentile_range": {
+    "vmin_pct": 1.0,
+    "vmax_pct": 99.0
+  }
+}
